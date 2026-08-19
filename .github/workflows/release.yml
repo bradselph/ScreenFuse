@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (leave as "latest" or specify e.g. v1.0.0)'
+        required: true
+        default: 'latest'
 
 permissions:
   contents: write
@@ -41,6 +46,7 @@ jobs:
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name }}
           files: |
             build/screenfuse_agent.exe
             build/screenfuse.exe
