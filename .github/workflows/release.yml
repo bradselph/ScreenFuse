@@ -1,0 +1,47 @@
+name: Build & Release Executables
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ScreenFuse Binaries (MSVC x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile Executables
+        shell: cmd
+        run: |
+          mkdir build
+
+          echo [*] Compiling screenfuse_agent.exe ...
+          cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /permissive- ^
+            /Fe"build\screenfuse_agent.exe" /Fo"build\agent_" ^
+            "src\agent_main.cpp"
+
+          echo [*] Compiling screenfuse.exe ...
+          cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /permissive- ^
+            /Fe"build\screenfuse.exe" /Fo"build\controller_" ^
+            "src\controller_main.cpp"
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/screenfuse_agent.exe
+            build/screenfuse.exe
+          generate_release_notes: true
