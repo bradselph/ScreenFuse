@@ -16,7 +16,9 @@ ScreenFuse captures both and merges them into one picture, in either of two ways
 
 - **Streaming** (`--stream`): the remote PC sends frames continuously and they
   are merged live into a window that OBS, Discord, or anything else that can
-  capture a window will take as a source.
+  capture a window will take as a source. `--audio` carries the remote PC's
+  sound along with the picture, and `--record` writes the merged stream to an
+  MP4 while it runs.
 
 The two are different trades, not different quality settings. A screenshot picks
 an instant in advance and proves both machines hit it. A stream cannot stop to
@@ -44,13 +46,14 @@ the thing being overlaid, and you would rather not buy a capture card:
 
 | Executable | Runs on | What it does |
 | --- | --- | --- |
-| `screenfuse_agent.exe` | the remote PC | Listens. Captures its display at an instant it is told, sends the pixels back. Nothing else. |
-| `screenfuse.exe` | the local PC | Drives everything: schedules the instant, captures the overlay monitor here, validates, merges, saves. |
+| `screenfuse_agent.exe` | the remote PC | Listens. Captures its display at an instant it is told, sends the pixels back. During a stream started with `--audio`, also taps what that PC is playing and sends it along. Nothing else. |
+| `screenfuse.exe` | the local PC | Drives everything: schedules the instant, captures the overlay monitor here, validates, merges, saves, plays and records. |
 
 The agent initiates nothing, touches nothing else on the machine it runs on -
 no injection, no hooks, no reading other processes - and exits when the
-controller disconnects. It duplicates a desktop and talks over one TCP socket,
-which is what every screen-sharing application does.
+controller disconnects. It duplicates a desktop, taps the default audio output
+the way every recording application does (and only when the controller asks
+for it), and talks over one TCP socket.
 
 ## Requirements
 
@@ -116,11 +119,11 @@ this PC's monitors and marks the one that window is on.
 
 ## Security
 
-The key authenticates the request. It does **not** encrypt the pixels - the
-image crosses the network in the clear, and so does the fact that a screenshot
-was taken. That is fine on a home or lab LAN and is not fine anywhere else. To
-cross an untrusted network, put both machines on a WireGuard or Tailscale
-interface and point `--host` at the tunnel address.
+The key authenticates the request. It does **not** encrypt the pixels or the
+audio - both cross the network in the clear, and so does the fact that a
+capture happened. That is fine on a home or lab LAN and is not fine anywhere
+else. To cross an untrusted network, put both machines on a WireGuard or
+Tailscale interface and point `--host` at the tunnel address.
 
 Treat `screenfuse.key` as a password: anyone with it and a route to the agent can
 ask that machine for its screen. It is generated with the system RNG, and
@@ -139,7 +142,8 @@ behind another window - it is captured from its own buffer, not from what is
 visible on screen.
 
 While streaming, `s` or Enter (or Ctrl+Shift+P) saves the frame currently on
-screen as a PNG, so screenshots are still available without stopping.
+screen as a PNG, and `r` starts or stops recording to an MP4, so stills and
+recordings are both available without stopping.
 
 | Option | Default | What it changes |
 | --- | --- | --- |
@@ -149,6 +153,10 @@ screen as a PNG, so screenshots are still available without stopping.
 | `--stream-raw` | off | Uncompressed frames - wired gigabit only |
 | `--stream-monitor <n>` | window | Show the output fullscreen on a monitor here |
 | `--stream-title <text>` | ScreenFuse Output | Title of the output window |
+| `--audio` | off | Carry the remote PC's sound too - see [Audio](#audio) |
+| `--audio-buffer <ms>` | 80 | Audio jitter buffer (150 with `--stream-raw`) |
+| `--record` | off | Record the merged stream - see [Recording](#recording) |
+| `--record-bitrate <n>` | scaled | H.264 Mbit/s, 2-50 (default ~6 at 1080p30) |
 
 `--overlay-delay`, `--merge`, `--key-low` and `--key-high` mean the same things
 they do for screenshots.
@@ -163,10 +171,10 @@ instead.
 
 Bandwidth is the thing to tune first. At 1080p, JPEG quality 80 is roughly
 130 Mbit/s at 60 fps and 65 Mbit/s at 30 - fine on wired gigabit, too much for
-Wi-Fi. Drop `--stream-fps` first, then `--stream-scale`, then `--stream-quality`;
-scale costs less picture than quality does. Measured end to end on a wired
-setup, a frame is about 20 ms old by the time it is on screen here, before a
-downstream encoder adds its share.
+Wi-Fi. `--audio` adds a flat 1.5 Mbit/s. Drop `--stream-fps` first, then
+`--stream-scale`, then `--stream-quality`; scale costs less picture than
+quality does. Measured end to end on a wired setup, a frame is about 20 ms old
+by the time it is on screen here, before a downstream encoder adds its share.
 
 If something in the chain wants a webcam rather than a window, point OBS at the
 window and turn on OBS's virtual camera; nothing here needs to change for that.
@@ -175,7 +183,63 @@ window and turn on OBS's virtual camera; nothing here needs to change for that.
 capturing a whole monitor. Do not point it at the monitor the overlay is on:
 that would feed the merged picture back into its own input.
 
-Audio is not touched.
+## Audio
+
+```cmd
+screenfuse.exe --host 192.168.1.20 --stream --audio
+```
+
+`--audio` makes the agent tap what the remote PC is playing - the same loopback
+capture every recording application uses - and send it alongside the video, as
+uncompressed 48 kHz stereo PCM (about 1.5 Mbit/s on top of the frames). It is
+played here on the default output, and recorded into the MP4 when `--record` is
+on. The default is off, and an agent that is never asked never touches audio.
+
+Points worth knowing:
+
+- The tap is of the remote PC's **default output device**, after its master
+  volume and mute - a muted remote PC streams silence. If the default device
+  changes over there mid-stream, the capture follows it.
+- When nothing is playing, silence is sent - the stream does not stop.
+- A remote PC with no sound device at all streams video without audio and says
+  so once; audio starts on its own if a device appears.
+- `--audio-buffer <ms>` sets how much audio is held here to ride out network
+  jitter. The 80 ms default suits JPEG streaming on a wired LAN; it rises to
+  150 automatically under `--stream-raw`, whose 8 MB frames stall the socket
+  longer. Raise it if audio crackles; latency rises with it.
+- Like the pixels, the audio crosses the network **in the clear**. See
+  [Security](#security).
+
+## Recording
+
+```cmd
+screenfuse.exe --host 192.168.1.20 --stream --record --audio
+```
+
+`--record` writes the merged stream to `Captured\<stamp>_stream.mp4` - H.264,
+with a 192 kbit/s AAC track when `--audio` is on - while the live window keeps
+running. The encoders are Windows' own (Media Foundation), so nothing extra is
+installed; on a Windows N edition, recording needs the Media Feature Pack and
+says so, while streaming works regardless.
+
+- `r` stops and restarts recording at any point during a stream; every start
+  is a new file. `--record` just starts with recording already on.
+- Frames go into the file stamped with their capture instants, so the
+  recording's timing matches what actually happened, not a nominal frame rate.
+  Audio is anchored to the same clock; quiet gaps and reconnects become
+  silence, not drift.
+- `--record-bitrate <n>` sets the H.264 rate in Mbit/s (2-50). The default
+  scales with resolution and rate - about 0.1 bits per pixel per frame,
+  6 Mbit/s at 1080p30.
+- If the picture changes size mid-recording (a remote display mode change),
+  the current file is closed cleanly and a new one starts.
+- Recording rides through agent reconnects: the gap is one held frame in the
+  video and silence in the audio.
+- If the encoder cannot keep up, frames are dropped from the recording (and
+  counted in the console) rather than stalling the live stream.
+- Ctrl+C, `q`, and closing the console window all finalize the file properly.
+  A recording killed harder than that (power loss, task manager) is left
+  without its index and will not play.
 
 ## Merging
 
@@ -339,9 +403,11 @@ matters more than bandwidth.
   and says so in the checks rather than pretending the capture is as good.
 - **The image crosses the network in the clear.** See [Security](#security).
 - **Something does run on the remote PC.** It performs no injection, no hooking
-  and no reads of any other process - it duplicates the desktop and talks over
-  one socket. It is still a process on that machine, which is worth knowing if
-  that machine is one you do not fully control.
+  and no reads of any other process - it duplicates the desktop, taps the
+  default audio output when a stream asks for it, and talks over one socket.
+  It is still a process on that machine, which is worth knowing if that
+  machine is one you do not fully control - and with `--audio` it hears
+  everything that machine plays, notification chimes included.
 - Secure desktops (UAC prompt, lock screen) cannot be captured. The agent
   reports access denied instead of silently returning black.
 - **A stream is not a verified capture.** Frames are paired after the fact by
@@ -364,6 +430,10 @@ matters more than bandwidth.
 | Captures rejected on skew | Something is stalling one machine at capture time. Raise `--lead`, and check neither side fell back to GDI. |
 | `desktop duplication is already in use` | Another application holds the maximum number of duplications on that output. |
 | `access denied - a secure desktop is up` | A UAC prompt or the lock screen is showing on the captured machine. |
+| Audio crackles or drops out | The jitter buffer is too small for the link. Raise `--audio-buffer`, especially alongside `--stream-raw`. |
+| Audio is silent but the stream works | The remote PC is muted, its default output has no signal, or it has no sound device (its console says which). |
+| `recording is unavailable: Media Foundation ...` | Windows N edition without the Media Feature Pack. Install it; streaming works without it. |
+| `cannot set up the H.264/AAC encoder` | Same Media Feature Pack case, or the frame exceeds the software encoder's 4096x2304 ceiling - lower `--stream-scale`. |
 
 ## Files
 
@@ -374,10 +444,12 @@ src\capture.hpp         monitor enumeration, Desktop Duplication, GDI fallback,
                         continuous capture for streaming
 src\image.hpp           image container, scaling, luma-key merge, PNG and JPEG via WIC
 src\stream.hpp          threaded frame handoff, parallel compositing, output window
+src\audio.hpp           WASAPI loopback capture, playback, packet queues
+src\record.hpp          MP4 recording (H.264 + AAC) via Media Foundation
 src\agent_main.cpp      remote PC half
 src\controller_main.cpp local PC half
 tools\make_test_frames.cpp  synthetic frames for checking the compositor
 ```
 
 Both executables are one translation unit each, no external dependencies -
-everything comes from the OS (DXGI, D3D11, WIC, BCrypt, Winsock).
+everything comes from the OS (DXGI, D3D11, WIC, WASAPI, Media Foundation,

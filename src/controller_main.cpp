@@ -3,6 +3,8 @@
 #include "capture.hpp"
 #include "image.hpp"
 #include "stream.hpp"
+#include "audio.hpp"
+#include "record.hpp"
 
 #include <atomic>
 #include <memory>
@@ -51,6 +53,12 @@ struct Options {
     int streamOutMonitor = -1;
     bool streamRaw = false;
     std::wstring streamTitle = L"ScreenFuse Output";
+
+    bool audio = false;
+    int audioBufferMs = 80;
+    bool audioBufferSet = false;
+    bool record = false;
+    int recordBitrateMbit = 0;
 
 
     std::wstring remergeRemote;
@@ -104,6 +112,17 @@ void PrintUsage() {
         "                         in a window, for capturing a whole display\n"
         "  --stream-title <s>     title of the output window (default ScreenFuse Output)\n"
         "\n"
+        " audio and recording (both need --stream):\n"
+        "  --audio                also capture what the remote PC is playing and play it\n"
+        "                         here; recorded too when --record is on\n"
+        "  --audio-buffer <ms>    audio jitter buffer depth (default 80, or 150 with\n"
+        "                         --stream-raw) - raise it if audio crackles\n"
+        "  --record               record the merged stream to an MP4 in the output folder;\n"
+        "                         [r] starts and stops it while streaming, each start is\n"
+        "                         a new file\n"
+        "  --record-bitrate <n>   H.264 bitrate in Mbit/s (default scales with the frame,\n"
+        "                         about 6 at 1080p30; accepted range 2-50)\n"
+        "\n"
         " the screenshot hotkey is Ctrl+Shift+P and works from any window;\n"
         " while streaming it saves the frame currently on screen\n"
         "\n"
@@ -134,6 +153,10 @@ bool ParseArgs(int argc, char** argv, Options& options) {
         else if (arg == "--no-keep-rejected") options.keepRejected = false;
         else if (arg == "--stream") options.stream = true;
         else if (arg == "--stream-raw") options.streamRaw = true;
+        else if (arg == "--audio") options.audio = true;
+        else if (arg == "--record") options.record = true;
+        else if (arg == "--audio-buffer" && hasValue) { options.audioBufferMs = atoi(value.c_str()); options.audioBufferSet = true; ++i; }
+        else if (arg == "--record-bitrate" && hasValue) { options.recordBitrateMbit = atoi(value.c_str()); ++i; }
         else if (arg == "--stream-fps" && hasValue) { options.streamFps = atoi(value.c_str()); ++i; }
         else if (arg == "--stream-quality" && hasValue) { options.streamQuality = atoi(value.c_str()); ++i; }
         else if (arg == "--stream-scale" && hasValue) { options.streamScale = atoi(value.c_str()); ++i; }
@@ -173,6 +196,25 @@ bool ParseArgs(int argc, char** argv, Options& options) {
     if (options.streamScale < 10) options.streamScale = 10;
     if (options.streamScale > 100) options.streamScale = 100;
 
+    if ((options.audio || options.record) && !options.stream &&
+        !options.help && !options.listMonitors && !options.generateKey) {
+        LogErr("--audio and --record only work with --stream");
+        return false;
+    }
+
+    if (options.audioBufferMs < 20) options.audioBufferMs = 20;
+    if (options.audioBufferMs > 2000) options.audioBufferMs = 2000;
+    if (options.audio && options.streamRaw && !options.audioBufferSet) options.audioBufferMs = 150;
+
+    if (options.recordBitrateMbit != 0) {
+        const int clamped = options.recordBitrateMbit < 2 ? 2
+            : (options.recordBitrateMbit > 50 ? 50 : options.recordBitrateMbit);
+        if (clamped != options.recordBitrateMbit) {
+            LogWarn("--record-bitrate %d is outside 2-50 Mbit/s - using %d", options.recordBitrateMbit, clamped);
+            options.recordBitrateMbit = clamped;
+        }
+    }
+
     return true;
 }
 
@@ -195,6 +237,18 @@ void ListMonitors(const std::wstring& overlayWindow) {
         printf("\n  (no window matched \"%s\" - it is not running, or the name is a title\n"
                "   and a class was needed, or the other way round)\n", ToUtf8(overlayWindow).c_str());
     }
+}
+
+std::atomic<bool> g_consoleQuit{ false };
+
+BOOL WINAPI ConsoleHandler(DWORD event) {
+    g_consoleQuit = true;
+
+    if (event == CTRL_CLOSE_EVENT || event == CTRL_LOGOFF_EVENT || event == CTRL_SHUTDOWN_EVENT) {
+        for (int waited = 0; waited < 90 && g_openRecordings.load() > 0; ++waited) Sleep(50);
+    }
+
+    return TRUE;
 }
 
 struct CheckLog {
@@ -575,6 +629,9 @@ bool Session::Connect() {
 
     if (!RecvMsg(sock, type, payload, error) || type != Msg::HelloAck || payload.size() != sizeof(HelloAckPayload)) {
         LogErr("handshake: %s", error.empty() ? "unexpected reply" : error.c_str());
+        LogErr("if the agent is from an older ScreenFuse build, replace it - this build speaks "
+            "protocol version %u and the agent's console says what it speaks",
+            static_cast<unsigned>(kProtocolVersion));
         Close();
         return false;
     }
@@ -728,6 +785,8 @@ char WaitForCommand(bool hotkeyRegistered, DWORD timeoutMs) {
     const int64_t deadlineTicks = QpcTicks() + UsToTicks(static_cast<int64_t>(timeoutMs) * 1000);
 
     for (;;) {
+        if (g_consoleQuit) return 'q';
+
         const int64_t remainUs = TicksToUs(deadlineTicks - QpcTicks());
         if (remainUs <= 0) return 0;
 
@@ -775,7 +834,8 @@ struct StreamState {
     std::atomic<uint64_t> decodeFailures{ 0 };
 };
 
-void StreamNetThreadBody(Session& session, StreamState& state) {
+void StreamNetThreadBody(Session& session, StreamState& state,
+    AudioPacketQueue* playbackQueue, StreamRecorder* recorder) {
     ComScope com;
     WicFactory wic;
 
@@ -828,6 +888,38 @@ void StreamNetThreadBody(Session& session, StreamState& state) {
         if (type == Msg::Error) {
             const std::string text(reinterpret_cast<const char*>(payload.data()), payload.size());
             LogWarn("stream: agent says: %s", text.c_str());
+            continue;
+        }
+
+        if (type == Msg::StreamAudio) {
+            if (payload.size() < sizeof(StreamAudioHeader)) continue;
+
+            StreamAudioHeader header{};
+            memcpy(&header, payload.data(), sizeof(header));
+
+            const size_t bodyBytes = payload.size() - sizeof(header);
+            if (header.payloadBytes != bodyBytes ||
+                bodyBytes == 0 ||
+                bodyBytes > kMaxAudioPayloadBytes ||
+                header.sampleRate != kAudioSampleRate ||
+                header.channels != kAudioChannels ||
+                header.bitsPerSample != kAudioBitsPerSample ||
+                bodyBytes % kAudioBlockAlign != 0) {
+                state.decodeFailures++;
+                continue;
+            }
+
+            const uint8_t* body = payload.data() + sizeof(header);
+            const int64_t stampUs = ToControllerUs(session.sync, header.captureUs);
+
+            if (recorder) recorder->PushAudio(body, bodyBytes, stampUs);
+
+            if (playbackQueue) {
+                AudioPacket packet;
+                packet.data.assign(body, body + bodyBytes);
+                packet.captureUs = stampUs;
+                playbackQueue->Push(std::move(packet));
+            }
             continue;
         }
 
@@ -886,9 +978,96 @@ void StreamNetThreadBody(Session& session, StreamState& state) {
     }
 }
 
-void StreamNetThread(Session& session, StreamState& state) {
-    StreamNetThreadBody(session, state);
+void StreamNetThread(Session& session, StreamState& state,
+    AudioPacketQueue* playbackQueue, StreamRecorder* recorder) {
+    StreamNetThreadBody(session, state, playbackQueue, recorder);
     state.netDone = true;
+}
+
+void AudioPlaybackThread(AudioPacketQueue& queue, std::atomic<bool>& stop, int targetMs) {
+    ComScope com;
+    AudioRenderer renderer;
+
+    bool open = false;
+    bool warned = false;
+    int64_t lastOpenAttemptUs = 0;
+    int64_t lastDeviceCheckUs = 0;
+
+    std::vector<uint8_t> pending;
+    size_t pendingOffset = 0;
+
+    while (!stop.load()) {
+        const int64_t nowUs = NowUs();
+
+        if (open && !renderer.ok()) {
+            LogWarn("audio: the output device went away - reopening");
+            renderer.Close();
+            open = false;
+        }
+
+        if (!open) {
+            if (nowUs - lastOpenAttemptUs < 1000000) {
+                Sleep(20);
+                continue;
+            }
+            lastOpenAttemptUs = nowUs;
+
+            std::string error;
+            if (renderer.Open(targetMs, error)) {
+                open = true;
+                warned = false;
+                LogInfo("audio: playing on the default output, %d ms buffer", targetMs);
+            } else {
+                if (!warned) {
+                    warned = true;
+                    LogWarn("audio: %s - playback is off until one appears", error.c_str());
+                }
+                queue.Clear();
+                continue;
+            }
+        }
+
+        if (nowUs - lastDeviceCheckUs > 1000000) {
+            lastDeviceCheckUs = nowUs;
+            if (renderer.DefaultDeviceChanged()) {
+                LogInfo("audio: the default output changed - following it");
+                renderer.Close();
+                open = false;
+                continue;
+            }
+        }
+
+        for (;;) {
+            if (pendingOffset >= pending.size()) {
+                pending.clear();
+                pendingOffset = 0;
+
+                AudioPacket packet;
+                if (!queue.Pop(packet)) break;
+                pending = std::move(packet.data);
+            }
+
+            const size_t written = renderer.Write(pending.data() + pendingOffset, pending.size() - pendingOffset);
+            if (written == 0) break;
+            pendingOffset += written;
+        }
+
+        // Keep total latency near the target: whatever waits here plus
+        // whatever already sits in the device.
+        const int64_t queuedMs = static_cast<int64_t>(queue.bytes() + (pending.size() - pendingOffset))
+            * 1000 / kAudioBytesPerSecond;
+        const int64_t depthMs = queuedMs + renderer.paddingMs();
+
+        if (depthMs > static_cast<int64_t>(targetMs) * 2 + 40) {
+            int64_t excessBytes = (depthMs - targetMs) * kAudioBytesPerSecond / 1000;
+            AudioPacket packet;
+            while (excessBytes > 0 && queue.Pop(packet)) {
+                excessBytes -= static_cast<int64_t>(packet.data.size());
+            }
+        }
+
+        Sleep(5);
+    }
 }
 
 void StreamOverlayThread(MonitorTarget target, StreamState& state, int fps) {
@@ -974,6 +1153,7 @@ char PollConsole() {
 
             if (ch == L'q' || ch == L'Q' || vk == VK_ESCAPE) return 'q';
             if (ch == L's' || ch == L'S' || vk == VK_RETURN) return 's';
+            if (ch == L'r' || ch == L'R') return 'r';
         }
     }
 }
@@ -1006,6 +1186,7 @@ bool StartStream(Session& session, int& width, int& height) {
     start.scalePercent = static_cast<uint16_t>(session.options.streamScale);
     start.quality = static_cast<uint8_t>(session.options.streamQuality);
     start.wireFormat = static_cast<uint8_t>(session.options.streamRaw ? WireFormat::RawBgra : WireFormat::Jpeg);
+    if (session.options.audio) start.flags |= kStreamStartFlagAudio;
 
     if (!SendMsg(session.sock, Msg::StreamStart, &start, sizeof(start))) {
         session.MarkDead("cannot ask the agent to start streaming");
@@ -1022,7 +1203,13 @@ bool StartStream(Session& session, int& width, int& height) {
             return false;
         }
 
-        if (type == Msg::Pong) continue;
+        if (type == Msg::Pong || type == Msg::StreamFrame || type == Msg::StreamAudio) continue;
+
+        if (type == Msg::Error) {
+            const std::string text(reinterpret_cast<const char*>(payload.data()), payload.size());
+            LogWarn("stream: agent says: %s", text.c_str());
+            continue;
+        }
 
         if (type != Msg::StreamStatus || payload.size() < sizeof(StreamStatusPayload)) {
             LogErr("stream: unexpected reply from the agent");
@@ -1058,12 +1245,13 @@ void StopStream(Session& session) {
     SendMsg(session.sock, Msg::StreamStop, nullptr, 0);
 }
 
-bool RunStreamOnce(Session& session, OutputWindow& window, bool& windowReady, bool hotkeyRegistered) {
+bool RunStreamOnce(Session& session, OutputWindow& window, bool& windowReady, bool hotkeyRegistered,
+    StreamRecorder* recorder, AudioPacketQueue* playbackQueue) {
     int width = 0, height = 0;
     if (!StartStream(session, width, height)) return session.linkDead;
 
     StreamState state;
-    std::thread net([&] { StreamNetThread(session, state); });
+    std::thread net([&] { StreamNetThread(session, state, playbackQueue, recorder); });
     std::thread overlay([&] { StreamOverlayThread(session.overlayTarget, state, session.options.streamFps); });
 
     Compositor compositor;
@@ -1093,9 +1281,12 @@ bool RunStreamOnce(Session& session, OutputWindow& window, bool& windowReady, bo
             }
         }
 
+        if (g_consoleQuit) { quit = true; break; }
+
         const char command = PollConsole();
         if (command == 'q') { quit = true; break; }
         if (command == 's') SaveStreamStill(session.options, merged);
+        if (command == 'r' && recorder) recorder->Toggle();
 
         const TimedFrame remote = state.remoteFrames.Get();
 
@@ -1181,6 +1372,12 @@ bool RunStreamOnce(Session& session, OutputWindow& window, bool& windowReady, bo
             break;
         }
 
+        if (recorder) {
+            const int64_t stampUs = overlayFrame.captureUs > remote.captureUs
+                ? overlayFrame.captureUs : remote.captureUs;
+            recorder->PushVideo(merged, stampUs);
+        }
+
         lastRemoteSerial = remote.serial;
         lastOverlaySerial = overlaySerial;
         dueTicks = now + frameTicks;
@@ -1217,23 +1414,54 @@ int RunStreamMode(Session& session, bool hotkeyRegistered) {
     OutputWindow window;
     bool windowReady = false;
 
-    LogInfo("streaming: [s] or Enter saves the merged frame, [q] or Esc quits%s",
-        hotkeyRegistered ? ", Ctrl+Shift+P saves from anywhere" : "");
+    StreamRecorder recorder(session.options.outDir, session.options.streamFps,
+        session.options.recordBitrateMbit > 0
+            ? static_cast<int64_t>(session.options.recordBitrateMbit) * 1000000
+            : 0,
+        session.options.audio, session.options.record);
+
+    std::unique_ptr<AudioPacketQueue> playbackQueue;
+    std::atomic<bool> playbackStop{ false };
+    std::thread playback;
+
+    if (session.options.audio) {
+        playbackQueue = std::make_unique<AudioPacketQueue>(2 * 1024 * 1024);
+        const int targetMs = session.options.audioBufferMs;
+        AudioPacketQueue* queue = playbackQueue.get();
+        playback = std::thread([queue, &playbackStop, targetMs] {
+            AudioPlaybackThread(*queue, playbackStop, targetMs);
+        });
+    }
+
+    LogInfo("streaming: [s] or Enter saves the merged frame, [r] starts/stops recording, "
+        "[q] or Esc quits%s", hotkeyRegistered ? ", Ctrl+Shift+P saves from anywhere" : "");
+    if (session.options.record) LogInfo("recording armed - a file starts with the first merged frame");
 
     for (;;) {
+        if (g_consoleQuit) break;
+
         if (!session.EnsureConnected()) {
             LogWarn("waiting for the agent to come back");
             Sleep(2000);
 
-            if (PollConsole() == 'q') break;
+            const char command = PollConsole();
+            if (command == 'q') break;
+            if (command == 'r') recorder.Toggle();
             continue;
         }
 
-        if (!RunStreamOnce(session, window, windowReady, hotkeyRegistered)) break;
+        if (!RunStreamOnce(session, window, windowReady, hotkeyRegistered,
+            &recorder, playbackQueue.get())) break;
 
         LogWarn("the stream stopped - reconnecting");
         Sleep(500);
     }
+
+    if (playback.joinable()) {
+        playbackStop = true;
+        playback.join();
+    }
+    recorder.Shutdown();
 
     window.Destroy();
     Disconnect(session);
@@ -1254,6 +1482,7 @@ int main(int argc, char** argv) {
     EnableDpiAwareness();
     RaiseTimerResolution();
     ComScope com;
+    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
     if (options.listMonitors) {
         ListMonitors(options.overlayWindow);

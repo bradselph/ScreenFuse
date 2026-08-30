@@ -7,7 +7,7 @@
 namespace screenfuse {
 
 constexpr uint32_t kMagic = 0x53554653;
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kProtocolVersion = 2;
 constexpr uint32_t kMaxPayloadBytes = 64u * 1024u * 1024u;
 constexpr uint16_t kDefaultPort = 20787;
 
@@ -27,7 +27,8 @@ enum class Msg : uint16_t {
     StreamStart = 13,
     StreamStop = 14,
     StreamStatus = 15,
-    StreamFrame = 16
+    StreamFrame = 16,
+    StreamAudio = 17
 };
 
 enum class WireFormat : uint8_t {
@@ -55,6 +56,10 @@ enum StreamStatusCode : uint32_t {
 };
 
 constexpr uint8_t kStreamFlagHeartbeat = 1 << 0;
+
+constexpr uint8_t kStreamStartFlagAudio = 1 << 0;
+
+constexpr uint32_t kMaxAudioPayloadBytes = 1u * 1024u * 1024u;
 
 #pragma pack(push, 1)
 
@@ -119,7 +124,8 @@ struct StreamStartPayload {
     uint16_t scalePercent;
     uint8_t quality;
     uint8_t wireFormat;
-    uint8_t reserved[2];
+    uint8_t flags;
+    uint8_t reserved;
 };
 
 struct StreamStatusPayload {
@@ -143,6 +149,17 @@ struct StreamFrameHeader {
     uint8_t wireFormat;
     uint8_t flags;
     uint8_t reserved[2];
+};
+
+struct StreamAudioHeader {
+    uint32_t seq;
+    int64_t captureUs;
+    uint32_t sampleRate;
+    uint16_t channels;
+    uint16_t bitsPerSample;
+    uint32_t payloadBytes;
+    uint8_t flags;
+    uint8_t reserved[3];
 };
 
 #pragma pack(pop)

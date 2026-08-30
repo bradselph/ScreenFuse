@@ -2,6 +2,11 @@
 #include "net.hpp"
 #include "capture.hpp"
 #include "stream.hpp"
+#include "audio.hpp"
+
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 using namespace screenfuse;
 
@@ -177,7 +182,8 @@ enum class StreamOutcome {
 };
 
 bool SendStreamStatus(SOCKET client, uint32_t status, const MonitorTarget* target,
-    int width, int height, bool gdi, uint32_t sourceFormat, const std::string& text) {
+    int width, int height, bool gdi, uint32_t sourceFormat, const std::string& text,
+    std::mutex* sendMutex = nullptr) {
 
     StreamStatusPayload payload{};
     payload.status = status;
@@ -188,8 +194,145 @@ bool SendStreamStatus(SOCKET client, uint32_t status, const MonitorTarget* targe
     payload.sourceFormat = sourceFormat;
     if (target) wcsncpy_s(payload.device, target->device.c_str(), _TRUNCATE);
 
+    if (sendMutex) {
+        std::lock_guard<std::mutex> lock(*sendMutex);
+        return SendMsg2(client, Msg::StreamStatus, &payload, sizeof(payload), text.data(), text.size());
+    }
     return SendMsg2(client, Msg::StreamStatus, &payload, sizeof(payload), text.data(), text.size());
 }
+
+
+void RunStreamAudio(SOCKET client, std::mutex& sendMutex, std::atomic<bool>& stop) {
+    ComScope com;
+    LoopbackCapture capture;
+
+    std::vector<uint8_t> pending;
+    int64_t pendingStampUs = 0;
+
+    bool open = false;
+    bool warnedNoDevice = false;
+    int64_t lastOpenAttemptUs = 0;
+    int64_t lastDeviceCheckUs = 0;
+    int64_t lastSendUs = NowUs();
+    uint32_t seq = 0;
+
+    const auto sendPending = [&](size_t minBytes) -> bool {
+        while (pending.size() >= minBytes && !pending.empty()) {
+            size_t bytes = pending.size();
+            if (bytes > kMaxAudioPayloadBytes) bytes = kMaxAudioPayloadBytes;
+            bytes -= bytes % kAudioBlockAlign;
+            if (bytes == 0) return true;
+
+            StreamAudioHeader header{};
+            header.seq = ++seq;
+            header.captureUs = pendingStampUs;
+            header.sampleRate = kAudioSampleRate;
+            header.channels = kAudioChannels;
+            header.bitsPerSample = kAudioBitsPerSample;
+            header.payloadBytes = static_cast<uint32_t>(bytes);
+
+            bool ok;
+            {
+                std::lock_guard<std::mutex> lock(sendMutex);
+                ok = SendMsg2(client, Msg::StreamAudio, &header, sizeof(header), pending.data(), bytes);
+            }
+            if (!ok) return false;
+
+            pendingStampUs += AudioFramesToUs(static_cast<int64_t>(bytes / kAudioBlockAlign));
+            pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(bytes));
+            lastSendUs = NowUs();
+        }
+        return true;
+    };
+
+    while (!stop.load()) {
+        const int64_t nowUs = NowUs();
+
+        if (!open) {
+            if (nowUs - lastOpenAttemptUs < 1000000) {
+                Sleep(20);
+                continue;
+            }
+            lastOpenAttemptUs = nowUs;
+
+            std::string error;
+            if (capture.Open(error)) {
+                open = true;
+                warnedNoDevice = false;
+                LogInfo("audio: capturing the default output (engine mix %u Hz %u ch -> %u Hz s16 stereo)",
+                    capture.mixRate(), capture.mixChannels(), kAudioSampleRate);
+            } else {
+                if (!warnedNoDevice) {
+                    warnedNoDevice = true;
+                    LogWarn("audio: %s - will keep trying", error.c_str());
+                    std::lock_guard<std::mutex> lock(sendMutex);
+                    SendText(client, Msg::Error, "audio: " + error + " - the stream continues without sound");
+                }
+                continue;
+            }
+        }
+
+        if (nowUs - lastDeviceCheckUs > 1000000) {
+            lastDeviceCheckUs = nowUs;
+            if (capture.DefaultDeviceChanged()) {
+                LogInfo("audio: the default output device changed - following it");
+                capture.Close();
+                pending.clear();
+                open = false;
+                continue;
+            }
+        }
+
+        std::string error;
+        if (!capture.Read(pending, pendingStampUs, error)) {
+            LogWarn("audio: %s - reopening", error.c_str());
+            capture.Close();
+            pending.clear();
+            open = false;
+            continue;
+        }
+
+        if (!sendPending(kAudioBlockAlign * (kAudioSampleRate / 100))) {
+            LogWarn("audio: send failed - audio stops (the stream follows if the link is dead)");
+            return;
+        }
+
+        if (pending.empty() && NowUs() - lastSendUs > 250000) {
+            const size_t frames = kAudioSampleRate / 50;
+            pendingStampUs = NowUs() - AudioFramesToUs(static_cast<int64_t>(frames));
+            pending.assign(frames * kAudioBlockAlign, 0);
+            if (!sendPending(1)) {
+                LogWarn("audio: send failed - audio stops (the stream follows if the link is dead)");
+                return;
+            }
+        }
+
+        Sleep(5);
+    }
+}
+
+
+struct AudioStreamThread {
+    std::thread thread;
+    std::atomic<bool> stop{ false };
+    SOCKET sock = INVALID_SOCKET;
+
+    void Start(SOCKET client, std::mutex& sendMutex) {
+        sock = client;
+        stop = false;
+        std::mutex* mutexPtr = &sendMutex;
+        thread = std::thread([this, client, mutexPtr] { RunStreamAudio(client, *mutexPtr, stop); });
+    }
+
+    void StopAndJoin(bool abortLink) {
+        if (!thread.joinable()) return;
+        stop = true;
+        if (abortLink && sock != INVALID_SOCKET) shutdown(sock, SD_BOTH);
+        thread.join();
+    }
+
+    ~AudioStreamThread() { StopAndJoin(false); }
+};
 
 int Clamp(int value, int low, int high) {
     if (value < low) return low;
@@ -226,6 +369,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
     const int quality = Clamp(start.quality ? start.quality : 80, 1, 100);
     const int scalePercent = Clamp(start.scalePercent ? start.scalePercent : 100, 10, 100);
     const WireFormat format = static_cast<WireFormat>(start.wireFormat);
+    const bool wantAudio = (start.flags & kStreamStartFlagAudio) != 0;
 
     const int outWidth = target->width() * scalePercent / 100;
     const int outHeight = target->height() * scalePercent / 100;
@@ -243,13 +387,18 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
         return StreamOutcome::LinkLost;
     }
 
+    std::mutex sendMutex;
+    AudioStreamThread audio;
+    if (wantAudio) audio.Start(client, sendMutex);
+
     const std::string formatText = format == WireFormat::Jpeg
         ? "JPEG quality " + std::to_string(quality)
         : std::string("raw BGRA");
 
-    LogInfo("stream: monitor %d (%s) %dx%d -> %dx%d, %d fps cap, %s",
+    LogInfo("stream: monitor %d (%s) %dx%d -> %dx%d, %d fps cap, %s%s",
         target->index, ToUtf8(target->device).c_str(),
-        target->width(), target->height(), outWidth, outHeight, fps, formatText.c_str());
+        target->width(), target->height(), outWidth, outHeight, fps, formatText.c_str(),
+        wantAudio ? ", with audio" : "");
 
     Image frame;
     Image scaled;
@@ -278,11 +427,13 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
 
             if (status != RecvStatus::Ok) {
                 LogInfo("%s: disconnected during the stream (%s)", peer.c_str(), error.c_str());
+                audio.StopAndJoin(true);
                 return StreamOutcome::LinkLost;
             }
 
             if (type == Msg::StreamStop) {
                 LogInfo("%s: stream stopped", peer.c_str());
+                audio.StopAndJoin(false);
                 SendStreamStatus(client, kStreamStopped, target, outWidth, outHeight,
                     capture.usedGdi(), capture.sourceFormat(), std::string());
                 return StreamOutcome::Stopped;
@@ -290,6 +441,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
 
             if (type == Msg::Shutdown) {
                 LogInfo("%s: shutdown requested during the stream", peer.c_str());
+                audio.StopAndJoin(false);
                 SendMsg(client, Msg::Bye, nullptr, 0);
                 return StreamOutcome::Shutdown;
             }
@@ -299,11 +451,21 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
                 PingPayload ping{};
                 memcpy(&ping, payload.data(), sizeof(ping));
                 PongPayload pong{ ping.clientSendUs, receivedUs, NowUs() };
-                if (!SendMsg(client, Msg::Pong, &pong, sizeof(pong))) return StreamOutcome::LinkLost;
+
+                bool sent;
+                {
+                    std::lock_guard<std::mutex> lock(sendMutex);
+                    sent = SendMsg(client, Msg::Pong, &pong, sizeof(pong));
+                }
+                if (!sent) {
+                    audio.StopAndJoin(true);
+                    return StreamOutcome::LinkLost;
+                }
                 continue;
             }
 
             if (type == Msg::CaptureReq) {
+                std::lock_guard<std::mutex> lock(sendMutex);
                 SendText(client, Msg::Error, "the agent is streaming - stop the stream before asking for a still");
                 continue;
             }
@@ -323,6 +485,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
 
             if (++reopenAttempts > 3 || !capture.Open(*target, error)) {
                 LogErr("stream: giving up on this monitor: %s", error.c_str());
+                audio.StopAndJoin(false);
                 SendStreamStatus(client, kStreamFailed, target, outWidth, outHeight,
                     capture.usedGdi(), capture.sourceFormat(), error);
                 return StreamOutcome::Stopped;
@@ -351,7 +514,15 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
             header.captureUs = nowUs;
             header.flags = kStreamFlagHeartbeat;
 
-            if (!SendMsg(client, Msg::StreamFrame, &header, sizeof(header))) return StreamOutcome::LinkLost;
+            bool sent;
+            {
+                std::lock_guard<std::mutex> lock(sendMutex);
+                sent = SendMsg(client, Msg::StreamFrame, &header, sizeof(header));
+            }
+            if (!sent) {
+                audio.StopAndJoin(true);
+                return StreamOutcome::LinkLost;
+            }
 
             lastSendUs = nowUs;
             dueTicks = now + frameTicks;
@@ -371,6 +542,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
             std::string encodeError;
             if (!EncodeJpeg(wic.get(), *source, quality, encoded, encodeError)) {
                 LogErr("stream: %s", encodeError.c_str());
+                audio.StopAndJoin(false);
                 SendStreamStatus(client, kStreamFailed, target, outWidth, outHeight,
                     capture.usedGdi(), capture.sourceFormat(), encodeError);
                 return StreamOutcome::Stopped;
@@ -388,8 +560,14 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
         header.payloadBytes = static_cast<uint32_t>(bodyBytes);
         header.wireFormat = static_cast<uint8_t>(format);
 
-        if (!SendMsg2(client, Msg::StreamFrame, &header, sizeof(header), body, bodyBytes)) {
+        bool frameSent;
+        {
+            std::lock_guard<std::mutex> lock(sendMutex);
+            frameSent = SendMsg2(client, Msg::StreamFrame, &header, sizeof(header), body, bodyBytes);
+        }
+        if (!frameSent) {
             LogInfo("%s: send failed during the stream", peer.c_str());
+            audio.StopAndJoin(true);
             return StreamOutcome::LinkLost;
         }
 
