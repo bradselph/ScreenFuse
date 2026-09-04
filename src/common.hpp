@@ -72,6 +72,12 @@ inline void WaitUntilTicks(int64_t targetTicks) {
     }
 }
 
+using LogHook = void (*)(const char* level, const char* stamp, const char* body, void* user);
+
+inline LogHook g_logHook = nullptr;
+inline void* g_logHookUser = nullptr;
+inline bool g_logToConsole = true;
+
 inline void LogLine(const char* level, const char* fmt, va_list args) {
     SYSTEMTIME st{};
     GetLocalTime(&st);
@@ -79,8 +85,15 @@ inline void LogLine(const char* level, const char* fmt, va_list args) {
     char body[2048];
     vsnprintf(body, sizeof(body), fmt, args);
 
-    printf("%02u:%02u:%02u.%03u %-5s %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, level, body);
-    fflush(stdout);
+    char stamp[16];
+    snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    if (g_logToConsole) {
+        printf("%s %-5s %s\n", stamp, level, body);
+        fflush(stdout);
+    }
+
+    if (g_logHook) g_logHook(level, stamp, body, g_logHookUser);
 }
 
 inline void LogInfo(const char* fmt, ...) {

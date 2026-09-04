@@ -4,6 +4,8 @@
 
 #include <mstcpip.h>
 
+#include <atomic>
+
 namespace screenfuse {
 
 constexpr uint32_t kMagic = 0x53554653;
@@ -197,6 +199,72 @@ inline void ConfigureSocket(SOCKET sock, int timeoutSeconds = 30) {
     tcp_keepalive keepAlive{ 1, 5000, 1000 };
     DWORD returned = 0;
     WSAIoctl(sock, SIO_KEEPALIVE_VALS, &keepAlive, sizeof(keepAlive), nullptr, 0, &returned, nullptr, nullptr);
+}
+
+inline bool ConnectWithTimeout(SOCKET sock, const sockaddr* address, int addressLength,
+    int timeoutMs, const std::atomic<bool>* cancelled, std::string& error) {
+
+    u_long nonBlocking = 1;
+    if (ioctlsocket(sock, FIONBIO, &nonBlocking) != 0) {
+        error = ErrorText(WSAGetLastError());
+        return false;
+    }
+
+    bool connected = false;
+
+    if (connect(sock, address, addressLength) == 0) {
+        connected = true;
+    } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        error = ErrorText(WSAGetLastError());
+    } else {
+        const int64_t deadlineTicks = QpcTicks() + UsToTicks(static_cast<int64_t>(timeoutMs) * 1000);
+
+        for (;;) {
+            if (cancelled && cancelled->load()) {
+                error = "cancelled";
+                break;
+            }
+
+            const int64_t remainUs = TicksToUs(deadlineTicks - QpcTicks());
+            if (remainUs <= 0) {
+                error = "timed out waiting for the connection to be accepted";
+                break;
+            }
+
+            fd_set writable, failed;
+            FD_ZERO(&writable);
+            FD_SET(sock, &writable);
+            FD_ZERO(&failed);
+            FD_SET(sock, &failed);
+
+            timeval tv{ 0, static_cast<long>(remainUs > 200000 ? 200000 : remainUs) };
+            const int ready = select(0, nullptr, &writable, &failed, &tv);
+
+            if (ready == SOCKET_ERROR) {
+                error = ErrorText(WSAGetLastError());
+                break;
+            }
+            if (ready == 0) continue;
+
+            int socketError = 0;
+            int length = static_cast<int>(sizeof(socketError));
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socketError), &length) != 0) {
+                error = ErrorText(WSAGetLastError());
+                break;
+            }
+            if (socketError != 0) {
+                error = ErrorText(static_cast<DWORD>(socketError));
+                break;
+            }
+
+            connected = true;
+            break;
+        }
+    }
+
+    nonBlocking = 0;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
+    return connected;
 }
 
 inline bool WaitReadable(SOCKET sock, int timeoutMs) {
