@@ -1,0 +1,7 @@
+#include "resource.h"
+
+SCREENFUSE_ICON_ID ICON "screenfuse.ico"
+
+#ifdef SCREENFUSE_FAVICON
+SCREENFUSE_FAVICON_ID RCDATA "screenfuse.ico"
+#endif

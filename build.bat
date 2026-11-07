@@ -21,16 +21,24 @@ if errorlevel 1 goto :no_toolset
 :have_compiler
 if not exist "%OUT%" mkdir "%OUT%"
 
+echo [*] Compiling the icon resources ...
+pushd "%ROOT%res"
+rc.exe /nologo /i "%ROOT%src" /fo "%OUT%\agent.res" screenfuse.rc
+if errorlevel 1 (popd & goto :build_failed)
+rc.exe /nologo /i "%ROOT%src" /d SCREENFUSE_FAVICON /fo "%OUT%\controller.res" screenfuse.rc
+if errorlevel 1 (popd & goto :build_failed)
+popd
+
 echo [*] Compiling screenfuse_agent.exe ...
 cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /permissive- ^
     /Fe"%OUT%\screenfuse_agent.exe" /Fo"%OUT%\agent_" ^
-    "%ROOT%src\agent_main.cpp"
+    "%ROOT%src\agent_main.cpp" "%OUT%\agent.res"
 if errorlevel 1 goto :build_failed
 
 echo [*] Compiling screenfuse.exe ...
 cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /permissive- ^
     /Fe"%OUT%\screenfuse.exe" /Fo"%OUT%\controller_" ^
-    "%ROOT%src\controller_main.cpp"
+    "%ROOT%src\controller_main.cpp" "%OUT%\controller.res"
 if errorlevel 1 goto :build_failed
 
 echo.

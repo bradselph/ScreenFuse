@@ -494,6 +494,10 @@ src\record.hpp          MP4 recording (H.264 + AAC) via Media Foundation
 src\agent_main.cpp      remote PC half
 src\controller_main.cpp local PC half
 tools\make_test_frames.cpp  synthetic frames for checking the compositor
+res\screenfuse.ico      the icon both executables carry (and the control panel's tab)
+res\screenfuse.rc       resource script that embeds it
+tools\make_icon.py      draws the icon at every size; python tools\make_icon.py
+                        rewrites res\screenfuse.ico (needs Pillow)
 ```
 
 Both executables are one translation unit each, no external dependencies -

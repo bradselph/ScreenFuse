@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "capture.hpp"
 #include "image.hpp"
+#include "resource.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -462,6 +463,9 @@ public:
         WNDCLASSEXW windowClass{ sizeof(WNDCLASSEXW) };
         windowClass.lpfnWndProc = &OutputWindow::WndProc;
         windowClass.hInstance = instance;
+        windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(SCREENFUSE_ICON_ID));
+        windowClass.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(SCREENFUSE_ICON_ID),
+            IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
         windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         windowClass.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         windowClass.lpszClassName = kClassName;

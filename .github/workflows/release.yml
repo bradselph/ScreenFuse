@@ -33,15 +33,21 @@ jobs:
         run: |
           mkdir build
 
+          echo [*] Compiling the icon resources ...
+          pushd res
+          rc.exe /nologo /i ..\src /fo ..\build\agent.res screenfuse.rc || exit /b 1
+          rc.exe /nologo /i ..\src /d SCREENFUSE_FAVICON /fo ..\build\controller.res screenfuse.rc || exit /b 1
+          popd
+
           echo [*] Compiling screenfuse_agent.exe ...
           cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /permissive- ^
             /Fe"build\screenfuse_agent.exe" /Fo"build\agent_" ^
-            "src\agent_main.cpp"
+            "src\agent_main.cpp" "build\agent.res"
 
           echo [*] Compiling screenfuse.exe ...
           cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /permissive- ^
             /Fe"build\screenfuse.exe" /Fo"build\controller_" ^
-            "src\controller_main.cpp"
+            "src\controller_main.cpp" "build\controller.res"
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2

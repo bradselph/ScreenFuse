@@ -473,8 +473,19 @@ inline void GuiApp::Route(const HttpRequest& request, HttpResponse& response) {
         return;
     }
     if (path == "/favicon.ico") {
-        response.status = 204;
         response.contentType = "image/x-icon";
+
+        const HMODULE module = GetModuleHandleW(nullptr);
+        const HRSRC found = FindResourceW(module, MAKEINTRESOURCEW(SCREENFUSE_FAVICON_ID), MAKEINTRESOURCEW(10));
+        const HGLOBAL loaded = found ? LoadResource(module, found) : nullptr;
+        const void* data = loaded ? LockResource(loaded) : nullptr;
+        const DWORD size = found ? SizeofResource(module, found) : 0;
+
+        if (data && size) {
+            response.body.assign(static_cast<const char*>(data), size);
+        } else {
+            response.status = 204;
+        }
         return;
     }
 
