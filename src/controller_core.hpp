@@ -55,6 +55,7 @@ struct Options {
     int streamScale = 100;
     int streamOutMonitor = -1;
     bool streamRaw = false;
+    bool highQuality = false;
     std::wstring streamTitle = L"ScreenFuse Output";
 
     bool audio = false;
@@ -111,6 +112,9 @@ void PrintUsage() {
         "  --stream-quality <n>   JPEG quality the remote PC encodes with, 1-100 (default 80)\n"
         "  --stream-scale <n>     percent of the remote PC's resolution to send (default 100)\n"
         "  --stream-raw           send uncompressed frames (wired gigabit only, ~14 fps at 1080p)\n"
+        "  --high-quality         keep full colour detail in the stream (sharper coloured text\n"
+        "                         and thin lines, at the cost of more network) and record at\n"
+        "                         2.5x the default bitrate\n"
         "  --stream-monitor <n>   show the output fullscreen on this monitor instead of\n"
         "                         in a window, for capturing a whole display\n"
         "  --stream-title <s>     title of the output window (default ScreenFuse Output)\n"
@@ -124,7 +128,8 @@ void PrintUsage() {
         "                         [r] starts and stops it while streaming, each start is\n"
         "                         a new file\n"
         "  --record-bitrate <n>   H.264 bitrate in Mbit/s (default scales with the frame,\n"
-        "                         about 6 at 1080p30; accepted range 2-50)\n"
+        "                         about 6 at 1080p30, 15 with --high-quality; accepted\n"
+        "                         range 2-50)\n"
         "\n"
         " the screenshot hotkey is Ctrl+Shift+P and works from any window;\n"
         " while streaming it saves the frame currently on screen\n"
@@ -161,6 +166,7 @@ bool ParseArgs(int argc, char** argv, Options& options) {
         else if (arg == "--no-keep-rejected") options.keepRejected = false;
         else if (arg == "--stream") options.stream = true;
         else if (arg == "--stream-raw") options.streamRaw = true;
+        else if (arg == "--high-quality") options.highQuality = true;
         else if (arg == "--audio") options.audio = true;
         else if (arg == "--record") options.record = true;
         else if (arg == "--audio-buffer" && hasValue) { options.audioBufferMs = atoi(value.c_str()); options.audioBufferSet = true; ++i; }
@@ -903,6 +909,9 @@ struct StreamState {
 
     FrameRing overlayFrames{ 12 };
 
+    std::shared_ptr<ImagePool> remotePool = std::make_shared<ImagePool>(4);
+    std::shared_ptr<ImagePool> overlayPool = std::make_shared<ImagePool>(4);
+
     std::atomic<int> targetWidth{ 0 };
     std::atomic<int> targetHeight{ 0 };
 
@@ -927,10 +936,10 @@ void StreamNetThreadBody(Session& session, StreamState& state,
     }
 
     RateMeter meter;
+    std::vector<uint8_t> payload;
 
     while (!state.stop) {
         Msg type{};
-        std::vector<uint8_t> payload;
         std::string error;
 
         const RecvStatus status = RecvMsgEx(session.sock, type, payload, error);
@@ -1019,7 +1028,7 @@ void StreamNetThreadBody(Session& session, StreamState& state,
             continue;
         }
 
-        auto image = std::make_shared<Image>();
+        std::shared_ptr<Image> image = state.remotePool->Acquire();
 
         if (static_cast<WireFormat>(header.wireFormat) == WireFormat::RawBgra) {
             const size_t expected = static_cast<size_t>(header.width) * header.height * 4;
@@ -1165,10 +1174,27 @@ void StreamOverlayThread(MonitorTarget target, StreamState& state, int fps) {
     const int64_t intervalTicks = UsToTicks(1000000 / captureFps);
     int64_t dueTicks = QpcTicks();
 
-    Image scaled;
+    Image captured;
+    bool pending = false;
+    int64_t pendingCaptureTicks = 0;
+    int64_t pendingPresentTicks = 0;
+
+    const auto recoverCapture = [&](const std::string& what) -> bool {
+        LogWarn("stream: overlay capture: %s", what.c_str());
+        pending = false;
+
+        std::string reopenError;
+        if (!capture.Open(target, reopenError)) {
+            LogErr("stream: overlay capture is gone: %s", reopenError.c_str());
+            state.overlayFailed = true;
+            return false;
+        }
+
+        Sleep(50);
+        return true;
+    };
 
     while (!state.stop) {
-        Image image;
         bool fresh = false;
         int64_t presentTicks = 0;
         int64_t captureTicks = 0;
@@ -1177,36 +1203,45 @@ void StreamOverlayThread(MonitorTarget target, StreamState& state, int fps) {
         if (waitUs < 0) waitUs = 0;
         if (waitUs > 50000) waitUs = 50000;
 
-        if (!capture.Next(static_cast<int>(waitUs / 1000), image, presentTicks, captureTicks, fresh, error)) {
-            LogWarn("stream: overlay capture: %s", error.c_str());
-            if (!capture.Open(target, error)) {
-                LogErr("stream: overlay capture is gone: %s", error.c_str());
-                state.overlayFailed = true;
-                return;
-            }
-            Sleep(50);
+        if (!capture.Next(static_cast<int>(waitUs / 1000), presentTicks, captureTicks, fresh, error)) {
+            if (!recoverCapture(error)) return;
             continue;
         }
 
-        if (!fresh || QpcTicks() < dueTicks) continue;
+        if (fresh) {
+            pending = true;
+            pendingCaptureTicks = captureTicks;
+            pendingPresentTicks = presentTicks;
+        }
+        if (pending && !capture.hasFrame()) pending = false;
+
+        if (!pending || QpcTicks() < dueTicks) continue;
 
         dueTicks = QpcTicks() + intervalTicks;
+        pending = false;
 
         const int targetWidth = state.targetWidth.load();
         const int targetHeight = state.targetHeight.load();
+        const bool rescale = targetWidth > 0 && targetHeight > 0 &&
+            (capture.frameWidth() != targetWidth || capture.frameHeight() != targetHeight);
 
-        std::shared_ptr<const Image> stored;
-        if (targetWidth > 0 && targetHeight > 0 && (image.width != targetWidth || image.height != targetHeight)) {
-            ScaleToInto(image, scaled, targetWidth, targetHeight);
-            stored = std::make_shared<const Image>(scaled);
-        } else {
-            stored = std::make_shared<const Image>(std::move(image));
+        std::shared_ptr<Image> stored = state.overlayPool->Acquire();
+
+        if (rescale) {
+            if (!capture.Read(captured, error)) {
+                if (!recoverCapture(error)) return;
+                continue;
+            }
+            ScaleToInto(captured, *stored, targetWidth, targetHeight);
+        } else if (!capture.Read(*stored, error)) {
+            if (!recoverCapture(error)) return;
+            continue;
         }
 
         TimedFrame frame;
         frame.image = std::move(stored);
-        frame.captureUs = TicksToUs(captureTicks);
-        frame.presentUs = presentTicks ? TicksToUs(presentTicks) : 0;
+        frame.captureUs = TicksToUs(pendingCaptureTicks);
+        frame.presentUs = pendingPresentTicks ? TicksToUs(pendingPresentTicks) : 0;
         frame.arrivedUs = frame.captureUs;
 
         state.overlayFrames.Push(std::move(frame));
@@ -1272,6 +1307,7 @@ bool StartStream(Session& session, int& width, int& height, StreamObserver* obse
     start.quality = static_cast<uint8_t>(session.options.streamQuality);
     start.wireFormat = static_cast<uint8_t>(session.options.streamRaw ? WireFormat::RawBgra : WireFormat::Jpeg);
     if (session.options.audio) start.flags |= kStreamStartFlagAudio;
+    if (session.options.highQuality) start.flags |= kStreamStartFlagFullChroma;
 
     if (!SendMsg(session.sock, Msg::StreamStart, &start, sizeof(start))) {
         session.MarkDead("cannot ask the agent to start streaming");
@@ -1317,10 +1353,17 @@ bool StartStream(Session& session, int& width, int& height, StreamObserver* obse
         width = status.width;
         height = status.height;
 
+        const bool fullChroma = (status.flags & kStreamStatusFlagFullChroma) != 0;
+
         LogInfo("streaming remote monitor %d (%s) %dx%d over %s%s",
             status.monitorIndex, ToUtf8(status.device).c_str(), status.width, status.height,
             status.method == static_cast<uint8_t>(CaptureMethod::Gdi) ? "GDI" : "duplication",
-            session.options.streamRaw ? ", raw BGRA" : ", JPEG");
+            session.options.streamRaw ? ", raw BGRA" : (fullChroma ? ", JPEG full colour" : ", JPEG"));
+
+        if (session.options.highQuality && !session.options.streamRaw && !fullChroma) {
+            LogWarn("stream: the agent on the remote PC is from an older build and ignores High quality - "
+                "copy this build's screenfuse_agent.exe over to it");
+        }
 
         if (observer) {
             observer->OnStreamStarted(status.width, status.height, ToUtf8(status.device),
@@ -1516,7 +1559,7 @@ int RunStreamMode(Session& session, bool hotkeyRegistered, ControlSource& contro
         session.options.recordBitrateMbit > 0
             ? static_cast<int64_t>(session.options.recordBitrateMbit) * 1000000
             : 0,
-        session.options.audio, session.options.record);
+        session.options.highQuality, session.options.audio, session.options.record);
 
     if (observer) observer->OnRecorder(&recorder);
 

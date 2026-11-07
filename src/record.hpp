@@ -29,8 +29,23 @@ struct MfApi {
     HRESULT(WINAPI* CreateSample)(IMFSample**) = nullptr;
     HRESULT(WINAPI* CreateMemoryBuffer)(DWORD, IMFMediaBuffer**) = nullptr;
     HRESULT(WINAPI* CreateSinkWriterFromURL)(LPCWSTR, IMFByteStream*, IMFAttributes*, IMFSinkWriter**) = nullptr;
+    HRESULT(WINAPI* CreateAttributes)(IMFAttributes**, UINT32) = nullptr;
     bool ok = false;
 };
+
+constexpr GUID kReadWriteEnableHardwareTransforms =
+    { 0xa634a91c, 0x822b, 0x41b9, { 0xa4, 0x94, 0x4d, 0xe4, 0x64, 0x36, 0x12, 0xb0 } };
+constexpr GUID kMediaTypeMpeg2Profile =
+    { 0xad76a80b, 0x2d5c, 0x4e0b, { 0xb3, 0x75, 0x64, 0xe5, 0x20, 0x13, 0x70, 0x36 } };
+constexpr GUID kTransformCategoryVideoEncoder =
+    { 0xf79eac7d, 0xe545, 0x4387, { 0xbd, 0xee, 0xd6, 0x47, 0xd7, 0xbd, 0xe4, 0x2a } };
+constexpr GUID kCodecApiRateControlMode =
+    { 0x1c0608e9, 0x370c, 0x4710, { 0x8a, 0x58, 0xcb, 0x61, 0x81, 0xc4, 0x24, 0x23 } };
+constexpr GUID kCodecApiMeanBitRate =
+    { 0xf7222374, 0x2144, 0x4815, { 0xb5, 0x50, 0xa3, 0x7f, 0x8e, 0x12, 0xee, 0x52 } };
+
+constexpr UINT32 kH264ProfileHigh = 100;
+constexpr UINT32 kRateControlUnconstrainedVbr = 2;
 
 inline const MfApi& Mf() {
     static const MfApi api = [] {
@@ -52,6 +67,8 @@ inline const MfApi& Mf() {
             GetProcAddress(plat, "MFCreateMemoryBuffer"));
         resolved.CreateSinkWriterFromURL = reinterpret_cast<HRESULT(WINAPI*)(LPCWSTR, IMFByteStream*, IMFAttributes*, IMFSinkWriter**)>(
             GetProcAddress(readWrite, "MFCreateSinkWriterFromURL"));
+        resolved.CreateAttributes = reinterpret_cast<HRESULT(WINAPI*)(IMFAttributes**, UINT32)>(
+            GetProcAddress(plat, "MFCreateAttributes"));
 
         resolved.ok = resolved.Startup && resolved.Shutdown && resolved.CreateMediaType &&
             resolved.CreateSample && resolved.CreateMemoryBuffer && resolved.CreateSinkWriterFromURL;
@@ -62,8 +79,9 @@ inline const MfApi& Mf() {
 
 inline std::atomic<int> g_openRecordings{ 0 };
 
-inline int64_t DefaultRecordBitrate(int width, int height, int fps) {
-    int64_t bits = static_cast<int64_t>(width) * height * fps / 10;
+inline int64_t DefaultRecordBitrate(int width, int height, int fps, bool highQuality) {
+    const int64_t pixelsPerSecond = static_cast<int64_t>(width) * height * fps;
+    int64_t bits = highQuality ? pixelsPerSecond / 4 : pixelsPerSecond / 10;
     if (bits < 2000000) bits = 2000000;
     if (bits > 50000000) bits = 50000000;
     return bits;
@@ -72,10 +90,12 @@ inline int64_t DefaultRecordBitrate(int width, int height, int fps) {
 
 class StreamRecorder {
 public:
-    StreamRecorder(std::wstring outDir, int fps, int64_t videoBitsPerSecond, bool audioExpected, bool startArmed)
+    StreamRecorder(std::wstring outDir, int fps, int64_t videoBitsPerSecond, bool highQuality,
+        bool audioExpected, bool startArmed)
         : outDir_(std::move(outDir)),
         fps_(fps < 1 ? 1 : fps),
         videoBitsPerSecond_(videoBitsPerSecond),
+        highQuality_(highQuality),
         audioExpected_(audioExpected),
         audioQueue_(4 * 1024 * 1024),
         desired_(startArmed) {
@@ -194,6 +214,7 @@ private:
             }
 
             if (!desired_.load() && writer_) CloseWriter(true);
+            if (failed_ && writer_) CloseWriter(true);
 
             ProcessVideoQueue();
             ProcessAudioQueue();
@@ -232,6 +253,8 @@ private:
                 ReturnBuffer(std::move(entry.image));
                 continue;
             }
+
+            if (failed_ && writer_) CloseWriter(true);
 
             const int evenWidth = entry.image->width & ~1;
             const int evenHeight = entry.image->height & ~1;
@@ -329,44 +352,131 @@ private:
 
         const std::wstring path = outDir_ + L"\\" + TimestampForFilename() + L"_stream.mp4";
 
-        IMFSinkWriter* writer = nullptr;
-        HRESULT hr = Mf().CreateSinkWriterFromURL(path.c_str(), nullptr, nullptr, &writer);
-        if (FAILED(hr) || !writer) {
-            LogErr("cannot create %s (hr=0x%08lx) - recording stopped",
-                ToUtf8(path).c_str(), static_cast<unsigned long>(hr));
-            return false;
-        }
-
         const int64_t bitrate = videoBitsPerSecond_ > 0
             ? videoBitsPerSecond_
-            : DefaultRecordBitrate(width, height, fps_);
+            : DefaultRecordBitrate(width, height, fps_, highQuality_);
+
+        struct EncoderSetup {
+            bool hardware;
+            bool tuned;
+        };
+        const EncoderSetup setups[] = { { true, true }, { false, true }, { false, false } };
+
+        HRESULT hr = E_FAIL;
+        bool created = false;
+
+        for (const EncoderSetup& setup : setups) {
+            if (setup.hardware && avoidHardware_) continue;
+            if ((setup.hardware || setup.tuned) && !Mf().CreateAttributes) continue;
+
+            IMFSinkWriter* writer = nullptr;
+            DWORD videoStream = 0;
+            DWORD audioStream = kNoStream;
+
+            hr = CreateWriter(path, width, height, bitrate, setup.hardware, setup.tuned,
+                writer, videoStream, audioStream, created);
+
+            if (SUCCEEDED(hr)) {
+                bool hardware = false;
+                const std::string encoderName = DescribeVideoEncoder(writer, videoStream, hardware);
+
+                writer_ = writer;
+                videoStream_ = videoStream;
+                audioStream_ = audioStream;
+                path_ = path;
+                recordWidth_ = width;
+                recordHeight_ = height;
+                epochUs_ = epochUs;
+                audioFramesWritten_ = 0;
+                lastVideoEndUs_ = 0;
+                failed_ = false;
+                usingHardware_ = hardware;
+                g_openRecordings++;
+
+                std::string encoderText = hardware ? "hardware encoder" : "software encoder";
+                if (!encoderName.empty()) encoderText += " " + encoderName;
+
+                LogInfo("recording to %s (%dx%d, %.1f Mbit/s H.264%s on the %s%s)",
+                    ToUtf8(path).c_str(), width, height,
+                    static_cast<double>(bitrate) / 1000000.0,
+                    setup.tuned ? " High" : "",
+                    encoderText.c_str(),
+                    audioStream_ != kNoStream ? ", 192 kbit/s AAC" : ", no audio");
+                return true;
+            }
+
+            if (created) DeleteFileW(path.c_str());
+        }
+
+        if (!created) {
+            LogErr("cannot create %s (hr=0x%08lx) - recording stopped",
+                ToUtf8(path).c_str(), static_cast<unsigned long>(hr));
+        } else if (hr == MF_E_TOPO_CODEC_NOT_FOUND || hr == MF_E_INVALIDMEDIATYPE) {
+            LogErr("cannot set up the H.264/AAC encoder (hr=0x%08lx) - on Windows N install "
+                "the Media Feature Pack; note the software encoder tops out at 4096x2304 - "
+                "recording stopped, press r to retry", static_cast<unsigned long>(hr));
+        } else {
+            LogErr("cannot start the recording (hr=0x%08lx) - press r to retry",
+                static_cast<unsigned long>(hr));
+        }
+        return false;
+    }
+
+    HRESULT CreateWriter(const std::wstring& path, int width, int height, int64_t bitrate,
+        bool hardware, bool tuned, IMFSinkWriter*& writerOut, DWORD& videoStreamOut,
+        DWORD& audioStreamOut, bool& created) {
+
+        writerOut = nullptr;
+        created = false;
+
+        IMFAttributes* writerAttributes = nullptr;
+        if (hardware) {
+            if (FAILED(Mf().CreateAttributes(&writerAttributes, 1)) || !writerAttributes) return E_FAIL;
+            writerAttributes->SetUINT32(kReadWriteEnableHardwareTransforms, TRUE);
+        }
+
+        IMFSinkWriter* writer = nullptr;
+        HRESULT hr = Mf().CreateSinkWriterFromURL(path.c_str(), nullptr, writerAttributes, &writer);
+        if (writerAttributes) writerAttributes->Release();
+        if (FAILED(hr) || !writer) return FAILED(hr) ? hr : E_FAIL;
+        created = true;
+
+        IMFAttributes* encoding = nullptr;
+        if (tuned && SUCCEEDED(Mf().CreateAttributes(&encoding, 2)) && encoding) {
+            encoding->SetUINT32(kCodecApiRateControlMode, kRateControlUnconstrainedVbr);
+            encoding->SetUINT32(kCodecApiMeanBitRate, static_cast<UINT32>(bitrate));
+        }
 
         DWORD videoStream = 0;
         IMFMediaType* type = nullptr;
 
-        bool ok = SUCCEEDED(Mf().CreateMediaType(&type));
-        if (ok) ok = SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-        if (ok) ok = SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264));
-        if (ok) ok = SUCCEEDED(type->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(bitrate)));
-        if (ok) ok = SUCCEEDED(MFSetAttributeSize(type, MF_MT_FRAME_SIZE,
-            static_cast<UINT32>(width), static_cast<UINT32>(height)));
-        if (ok) ok = SUCCEEDED(MFSetAttributeRatio(type, MF_MT_FRAME_RATE, static_cast<UINT32>(fps_), 1));
-        if (ok) ok = SUCCEEDED(MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
-        if (ok) ok = SUCCEEDED(type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
-        if (ok) ok = SUCCEEDED(writer->AddStream(type, &videoStream));
+        hr = Mf().CreateMediaType(&type);
+        if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        if (SUCCEEDED(hr)) hr = type->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(bitrate));
+        if (SUCCEEDED(hr)) hr = MFSetAttributeSize(type, MF_MT_FRAME_SIZE,
+            static_cast<UINT32>(width), static_cast<UINT32>(height));
+        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(type, MF_MT_FRAME_RATE, static_cast<UINT32>(fps_), 1);
+        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (SUCCEEDED(hr)) hr = type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (SUCCEEDED(hr) && tuned) hr = type->SetUINT32(kMediaTypeMpeg2Profile, kH264ProfileHigh);
+        if (SUCCEEDED(hr)) hr = writer->AddStream(type, &videoStream);
         if (type) { type->Release(); type = nullptr; }
 
-        if (ok) ok = SUCCEEDED(Mf().CreateMediaType(&type));
-        if (ok) ok = SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-        if (ok) ok = SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32));
-        if (ok) ok = SUCCEEDED(MFSetAttributeSize(type, MF_MT_FRAME_SIZE,
-            static_cast<UINT32>(width), static_cast<UINT32>(height)));
-        if (ok) ok = SUCCEEDED(MFSetAttributeRatio(type, MF_MT_FRAME_RATE, static_cast<UINT32>(fps_), 1));
-        if (ok) ok = SUCCEEDED(MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
-        if (ok) ok = SUCCEEDED(type->SetUINT32(MF_MT_DEFAULT_STRIDE,
-            static_cast<UINT32>(-4 * width)));
-        if (ok) ok = SUCCEEDED(writer->SetInputMediaType(videoStream, type, nullptr));
+        if (SUCCEEDED(hr)) hr = Mf().CreateMediaType(&type);
+        if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (SUCCEEDED(hr)) hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (SUCCEEDED(hr)) hr = MFSetAttributeSize(type, MF_MT_FRAME_SIZE,
+            static_cast<UINT32>(width), static_cast<UINT32>(height));
+        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(type, MF_MT_FRAME_RATE, static_cast<UINT32>(fps_), 1);
+        if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (SUCCEEDED(hr)) hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE,
+            static_cast<UINT32>(-4 * width));
+        if (SUCCEEDED(hr)) hr = writer->SetInputMediaType(videoStream, type, encoding);
         if (type) { type->Release(); type = nullptr; }
+        if (encoding) { encoding->Release(); encoding = nullptr; }
+
+        bool ok = SUCCEEDED(hr);
 
         DWORD audioStream = kNoStream;
         const bool wantAudio = audioExpected_ && !audioDead_.load();
@@ -397,41 +507,58 @@ private:
         }
 
         if (ok) {
-            const HRESULT begin = writer->BeginWriting();
-            ok = SUCCEEDED(begin);
-            hr = begin;
+            hr = writer->BeginWriting();
+            ok = SUCCEEDED(hr);
+        } else if (SUCCEEDED(hr)) {
+            hr = E_FAIL;
         }
 
         if (!ok) {
             writer->Release();
-            if (hr == MF_E_TOPO_CODEC_NOT_FOUND || hr == MF_E_INVALIDMEDIATYPE) {
-                LogErr("cannot set up the H.264/AAC encoder (hr=0x%08lx) - on Windows N install "
-                    "the Media Feature Pack; note the software encoder tops out at 4096x2304 - "
-                    "recording stopped, press r to retry", static_cast<unsigned long>(hr));
-            } else {
-                LogErr("cannot start the recording (hr=0x%08lx) - press r to retry",
-                    static_cast<unsigned long>(hr));
-            }
-            return false;
+            return FAILED(hr) ? hr : E_FAIL;
         }
 
-        writer_ = writer;
-        videoStream_ = videoStream;
-        audioStream_ = audioStream;
-        path_ = path;
-        recordWidth_ = width;
-        recordHeight_ = height;
-        epochUs_ = epochUs;
-        audioFramesWritten_ = 0;
-        lastVideoEndUs_ = 0;
-        failed_ = false;
-        g_openRecordings++;
+        writerOut = writer;
+        videoStreamOut = videoStream;
+        audioStreamOut = audioStream;
+        return S_OK;
+    }
 
-        LogInfo("recording to %s (%dx%d, %.1f Mbit/s H.264%s)",
-            ToUtf8(path).c_str(), width, height,
-            static_cast<double>(bitrate) / 1000000.0,
-            audioStream_ != kNoStream ? ", 192 kbit/s AAC" : ", no audio");
-        return true;
+    static std::string DescribeVideoEncoder(IMFSinkWriter* writer, DWORD stream, bool& hardware) {
+        hardware = false;
+        std::string name;
+
+        IMFSinkWriterEx* extended = nullptr;
+        if (FAILED(writer->QueryInterface(IID_PPV_ARGS(&extended))) || !extended) return name;
+
+        for (DWORD index = 0; index < 16; ++index) {
+            GUID category{};
+            IMFTransform* transform = nullptr;
+            if (FAILED(extended->GetTransformForStream(stream, index, &category, &transform)) || !transform) break;
+
+            if (IsEqualGUID(category, kTransformCategoryVideoEncoder)) {
+                IMFAttributes* attributes = nullptr;
+                if (SUCCEEDED(transform->GetAttributes(&attributes)) && attributes) {
+                    UINT32 length = 0;
+                    if (SUCCEEDED(attributes->GetStringLength(MFT_ENUM_HARDWARE_URL_Attribute, &length))) {
+                        hardware = true;
+                    }
+
+                    WCHAR* friendly = nullptr;
+                    UINT32 friendlyLength = 0;
+                    if (SUCCEEDED(attributes->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendly, &friendlyLength)) && friendly) {
+                        name = ToUtf8(std::wstring(friendly, friendlyLength));
+                        CoTaskMemFree(friendly);
+                    }
+                    attributes->Release();
+                }
+            }
+
+            transform->Release();
+        }
+
+        extended->Release();
+        return name;
     }
 
     void CloseWriter(bool logResult) {
@@ -565,6 +692,13 @@ private:
     void Fail(const char* what) {
         if (failed_) return;
         failed_ = true;
+
+        if (usingHardware_ && !avoidHardware_) {
+            avoidHardware_ = true;
+            LogWarn("the hardware video encoder failed (%s) - carrying on in a new file on the software encoder", what);
+            return;
+        }
+
         desired_ = false;
         LogErr("recording failed: %s - press r to start a new file", what);
     }
@@ -580,6 +714,7 @@ private:
     std::wstring outDir_;
     int fps_ = 30;
     int64_t videoBitsPerSecond_ = 0;
+    bool highQuality_ = false;
     bool audioExpected_ = false;
 
     std::mutex mutex_;
@@ -608,6 +743,8 @@ private:
     int64_t lastVideoEndUs_ = 0;
     VideoEntry held_;
     bool failed_ = false;
+    bool usingHardware_ = false;
+    bool avoidHardware_ = false;
 
     std::thread worker_;
 };

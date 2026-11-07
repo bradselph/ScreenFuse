@@ -37,6 +37,7 @@ inline std::string OptionsJson(const controller::Options& options) {
         .Field("streamScale", options.streamScale)
         .Field("streamOutMonitor", options.streamOutMonitor)
         .Field("streamRaw", options.streamRaw)
+        .Field("highQuality", options.highQuality)
         .Field("streamTitle", options.streamTitle)
         .Field("audio", options.audio)
         .Field("audioBufferMs", options.audioBufferMs)
@@ -103,6 +104,7 @@ inline void MergeOptions(const JsonValue& body, controller::Options& options,
     if (body.Has("streamScale")) options.streamScale = Clamp(body.GetInt("streamScale", options.streamScale), 10, 100);
     if (body.Has("streamOutMonitor")) options.streamOutMonitor = body.GetInt("streamOutMonitor", options.streamOutMonitor);
     if (body.Has("streamRaw")) options.streamRaw = body.GetBool("streamRaw", options.streamRaw);
+    if (body.Has("highQuality")) options.highQuality = body.GetBool("highQuality", options.highQuality);
     if (body.Has("streamTitle")) {
         const std::string title = body.GetString("streamTitle", "");
         options.streamTitle = title.empty() ? L"ScreenFuse Output" : ToWide(title);

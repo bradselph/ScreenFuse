@@ -25,6 +25,12 @@ struct Image {
         height = h;
         pixels.assign(static_cast<size_t>(w) * h * 4, 0);
     }
+
+    void reshape(int w, int h) {
+        width = w;
+        height = h;
+        pixels.resize(static_cast<size_t>(w) * h * 4);
+    }
 };
 
 struct ComScope {
@@ -319,51 +325,165 @@ inline bool EncodePng(const Image& image, std::vector<uint8_t>& out, std::string
     return ok;
 }
 
-inline bool EncodeJpeg(IWICImagingFactory* factory, const Image& image, int quality,
-    std::vector<uint8_t>& out, std::string& error) {
+class JpegEncoder {
+public:
+    JpegEncoder() = default;
+    ~JpegEncoder() { DropStream(); }
 
-    if (!factory || !image.valid()) {
-        error = "refusing to encode an invalid image";
-        return false;
+    JpegEncoder(const JpegEncoder&) = delete;
+    JpegEncoder& operator=(const JpegEncoder&) = delete;
+
+    bool Encode(IWICImagingFactory* factory, const Image& image, int quality, bool fullChroma,
+        std::vector<uint8_t>& out, std::string& error) {
+
+        if (!factory || !image.valid()) {
+            error = "refusing to encode an invalid image";
+            return false;
+        }
+
+        if (quality < 1) quality = 1;
+        if (quality > 100) quality = 100;
+
+        if (!stream_ && FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream_))) {
+            stream_ = nullptr;
+            error = "WIC: cannot create a memory stream";
+            return false;
+        }
+
+        LARGE_INTEGER zero{};
+        if (FAILED(stream_->Seek(zero, STREAM_SEEK_SET, nullptr))) {
+            DropStream();
+            error = "WIC: cannot rewind the memory stream";
+            return false;
+        }
+
+        IWICBitmapEncoder* encoder = nullptr;
+        bool ok = SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder));
+        if (!ok) error = "WIC: cannot create the JPEG encoder";
+
+        if (ok) ok = SUCCEEDED(encoder->Initialize(stream_, WICBitmapEncoderNoCache));
+
+        IWICBitmapFrameEncode* frame = nullptr;
+        IPropertyBag2* properties = nullptr;
+        if (ok) ok = SUCCEEDED(encoder->CreateNewFrame(&frame, &properties));
+
+        if (ok && properties) {
+            PROPBAG2 option{};
+            option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+            VARIANT value{};
+            value.vt = VT_R4;
+            value.fltVal = static_cast<float>(quality) / 100.0f;
+            properties->Write(1, &option, &value);
+
+            if (fullChroma) {
+                PROPBAG2 chromaOption{};
+                chromaOption.pstrName = const_cast<LPOLESTR>(L"JpegYCrCbSubsampling");
+                VARIANT chromaValue{};
+                chromaValue.vt = VT_UI1;
+                chromaValue.bVal = static_cast<BYTE>(WICJpegYCrCbSubsampling444);
+                properties->Write(1, &chromaOption, &chromaValue);
+            }
+        }
+
+        if (ok) ok = SUCCEEDED(frame->Initialize(properties));
+        if (ok) ok = SUCCEEDED(frame->SetSize(static_cast<UINT>(image.width), static_cast<UINT>(image.height)));
+
+        WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+        if (ok) ok = SUCCEEDED(frame->SetPixelFormat(&format));
+
+        if (ok) {
+            ok = IsEqualGUID(format, GUID_WICPixelFormat24bppBGR)
+                ? WriteRows(frame, image, error)
+                : WriteConverted(factory, frame, image, format, error);
+        }
+
+        if (ok) ok = SUCCEEDED(frame->Commit());
+        if (ok) ok = SUCCEEDED(encoder->Commit());
+
+        if (ok) {
+            ULARGE_INTEGER position{};
+            HGLOBAL memory = nullptr;
+            ok = SUCCEEDED(stream_->Seek(zero, STREAM_SEEK_CUR, &position)) && position.QuadPart > 0 &&
+                SUCCEEDED(GetHGlobalFromStream(stream_, &memory));
+
+            const void* data = ok ? GlobalLock(memory) : nullptr;
+            if (data && position.QuadPart <= GlobalSize(memory)) {
+                const uint8_t* bytes = static_cast<const uint8_t*>(data);
+                out.assign(bytes, bytes + static_cast<size_t>(position.QuadPart));
+            } else {
+                ok = false;
+                error = "WIC: cannot read back the encoded JPEG";
+            }
+            if (data) GlobalUnlock(memory);
+        }
+
+        if (properties) properties->Release();
+        if (frame) frame->Release();
+        if (encoder) encoder->Release();
+
+        if (!ok) {
+            DropStream();
+            if (error.empty()) error = "WIC: JPEG encode failed";
+        }
+        return ok;
     }
 
-    if (quality < 1) quality = 1;
-    if (quality > 100) quality = 100;
+private:
+    static constexpr int kStripRows = 32;
 
-    IStream* stream = nullptr;
-    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) {
-        error = "WIC: cannot create a memory stream";
-        return false;
+    void DropStream() {
+        if (stream_) {
+            stream_->Release();
+            stream_ = nullptr;
+        }
     }
 
-    IWICBitmapEncoder* encoder = nullptr;
-    bool ok = SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder));
-    if (!ok) error = "WIC: cannot create the JPEG encoder";
+    bool WriteRows(IWICBitmapFrameEncode* frame, const Image& image, std::string& error) {
+        const UINT stripStride = (static_cast<UINT>(image.width) * 3 + 3) & ~3u;
+        strip_.resize(static_cast<size_t>(stripStride) * kStripRows);
 
-    if (ok) ok = SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache));
+        const int quads = image.width / 4;
 
-    IWICBitmapFrameEncode* frame = nullptr;
-    IPropertyBag2* properties = nullptr;
-    if (ok) ok = SUCCEEDED(encoder->CreateNewFrame(&frame, &properties));
+        for (int y = 0; y < image.height; y += kStripRows) {
+            const int rows = image.height - y < kStripRows ? image.height - y : kStripRows;
 
-    if (ok && properties) {
-        PROPBAG2 option{};
-        option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
-        VARIANT value{};
-        value.vt = VT_R4;
-        value.fltVal = static_cast<float>(quality) / 100.0f;
-        properties->Write(1, &option, &value);
+            for (int r = 0; r < rows; ++r) {
+                const uint8_t* source = image.pixels.data() + static_cast<size_t>(y + r) * image.stride();
+                uint8_t* dest = strip_.data() + static_cast<size_t>(r) * stripStride;
+
+                for (int q = 0; q < quads; ++q, source += 16, dest += 12) {
+                    uint32_t p[4];
+                    memcpy(p, source, sizeof(p));
+                    const uint32_t packed[3] = {
+                        (p[0] & 0x00FFFFFFu) | (p[1] << 24),
+                        ((p[1] >> 8) & 0x0000FFFFu) | (p[2] << 16),
+                        ((p[2] >> 16) & 0x000000FFu) | (p[3] << 8),
+                    };
+                    memcpy(dest, packed, sizeof(packed));
+                }
+
+                for (int x = quads * 4; x < image.width; ++x, source += 4, dest += 3) {
+                    dest[0] = source[0];
+                    dest[1] = source[1];
+                    dest[2] = source[2];
+                }
+            }
+
+            if (FAILED(frame->WritePixels(static_cast<UINT>(rows), stripStride,
+                    stripStride * static_cast<UINT>(rows), strip_.data()))) {
+                error = "WIC: the JPEG encoder refused the pixels";
+                return false;
+            }
+        }
+
+        return true;
     }
 
-    if (ok) ok = SUCCEEDED(frame->Initialize(properties));
-    if (ok) ok = SUCCEEDED(frame->SetSize(static_cast<UINT>(image.width), static_cast<UINT>(image.height)));
+    static bool WriteConverted(IWICImagingFactory* factory, IWICBitmapFrameEncode* frame,
+        const Image& image, const WICPixelFormatGUID& format, std::string& error) {
 
-    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
-    if (ok) ok = SUCCEEDED(frame->SetPixelFormat(&format));
-
-    IWICBitmap* source = nullptr;
-    if (ok) {
-        ok = SUCCEEDED(factory->CreateBitmapFromMemory(
+        IWICBitmap* source = nullptr;
+        bool ok = SUCCEEDED(factory->CreateBitmapFromMemory(
             static_cast<UINT>(image.width),
             static_cast<UINT>(image.height),
             GUID_WICPixelFormat32bppBGRA,
@@ -372,47 +492,25 @@ inline bool EncodeJpeg(IWICImagingFactory* factory, const Image& image, int qual
             const_cast<BYTE*>(image.pixels.data()),
             &source));
         if (!ok) error = "WIC: cannot wrap the pixel buffer";
+
+        IWICFormatConverter* converter = nullptr;
+        if (ok) ok = SUCCEEDED(factory->CreateFormatConverter(&converter));
+        if (ok) ok = SUCCEEDED(converter->Initialize(source, format, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
+        if (ok) ok = SUCCEEDED(frame->WriteSource(converter, nullptr));
+
+        if (converter) converter->Release();
+        if (source) source->Release();
+        return ok;
     }
 
-    IWICFormatConverter* converter = nullptr;
-    if (ok) ok = SUCCEEDED(factory->CreateFormatConverter(&converter));
-    if (ok) ok = SUCCEEDED(converter->Initialize(source, format, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
+    IStream* stream_ = nullptr;
+    std::vector<uint8_t> strip_;
+};
 
-    if (ok) ok = SUCCEEDED(frame->WriteSource(converter, nullptr));
-    if (ok) ok = SUCCEEDED(frame->Commit());
-    if (ok) ok = SUCCEEDED(encoder->Commit());
-
-    if (ok) {
-        HGLOBAL memory = nullptr;
-        ok = SUCCEEDED(GetHGlobalFromStream(stream, &memory));
-        if (ok) {
-            LARGE_INTEGER zero{};
-            ULARGE_INTEGER position{};
-            stream->Seek(zero, STREAM_SEEK_CUR, &position);
-
-            SIZE_T size = GlobalSize(memory);
-            if (position.QuadPart > 0 && position.QuadPart < size) size = static_cast<SIZE_T>(position.QuadPart);
-
-            const void* data = GlobalLock(memory);
-            if (data) {
-                out.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
-                GlobalUnlock(memory);
-            } else {
-                ok = false;
-                error = "WIC: cannot lock the encoded JPEG";
-            }
-        }
-    }
-
-    if (converter) converter->Release();
-    if (source) source->Release();
-    if (properties) properties->Release();
-    if (frame) frame->Release();
-    if (encoder) encoder->Release();
-    if (stream) stream->Release();
-
-    if (!ok && error.empty()) error = "WIC: JPEG encode failed";
-    return ok;
+inline bool EncodeJpeg(IWICImagingFactory* factory, const Image& image, int quality,
+    std::vector<uint8_t>& out, std::string& error) {
+    JpegEncoder encoder;
+    return encoder.Encode(factory, image, quality, false, out, error);
 }
 
 inline bool DecodeImageBytes(IWICImagingFactory* factory, const uint8_t* data, size_t length,
@@ -445,7 +543,7 @@ inline bool DecodeImageBytes(IWICImagingFactory* factory, const uint8_t* data, s
     }
 
     if (ok) {
-        out.allocate(static_cast<int>(width), static_cast<int>(height));
+        out.reshape(static_cast<int>(width), static_cast<int>(height));
         ok = SUCCEEDED(converter->CopyPixels(nullptr,
             static_cast<UINT>(out.stride()),
             static_cast<UINT>(out.pixels.size()),

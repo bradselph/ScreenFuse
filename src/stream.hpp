@@ -5,6 +5,8 @@
 #include "image.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -21,6 +23,98 @@ inline unsigned PixelWorkers() {
     return workers;
 }
 
+class PixelPool {
+public:
+    using PartFn = void (*)(void* context, int rowBegin, int rowEnd);
+
+    static PixelPool& Get() {
+        static PixelPool* pool = new PixelPool(PixelWorkers() - 1);
+        return *pool;
+    }
+
+    void Run(int height, int parts, PartFn fn, void* context) {
+        auto batch = std::make_shared<Batch>();
+        batch->fn = fn;
+        batch->context = context;
+        batch->height = height;
+        batch->parts = parts;
+        batch->chunk = (height + parts - 1) / parts;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back(batch);
+        }
+        wake_.notify_all();
+
+        while (RunPart(*batch)) {}
+
+        {
+            std::unique_lock<std::mutex> lock(batch->mutex);
+            batch->finished.wait(lock, [&] { return batch->done.load() == batch->parts; });
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+            if (*it == batch) {
+                queue_.erase(it);
+                break;
+            }
+        }
+    }
+
+private:
+    struct Batch {
+        PartFn fn = nullptr;
+        void* context = nullptr;
+        int height = 0;
+        int parts = 0;
+        int chunk = 0;
+        std::atomic<int> next{ 0 };
+        std::atomic<int> done{ 0 };
+        std::mutex mutex;
+        std::condition_variable finished;
+    };
+
+    explicit PixelPool(unsigned threads) {
+        for (unsigned i = 0; i < threads; ++i) std::thread([this] { WorkerLoop(); }).detach();
+    }
+
+    static bool RunPart(Batch& batch) {
+        const int part = batch.next.fetch_add(1);
+        if (part >= batch.parts) return false;
+
+        const int begin = part * batch.chunk;
+        const int end = begin + batch.chunk < batch.height ? begin + batch.chunk : batch.height;
+        if (begin < end) batch.fn(batch.context, begin, end);
+
+        if (batch.done.fetch_add(1) + 1 == batch.parts) {
+            std::lock_guard<std::mutex> lock(batch.mutex);
+            batch.finished.notify_all();
+        }
+        return true;
+    }
+
+    void WorkerLoop() {
+        for (;;) {
+            std::shared_ptr<Batch> batch;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [this] { return !queue_.empty(); });
+                batch = queue_.front();
+                if (batch->next.load() >= batch->parts) {
+                    queue_.pop_front();
+                    continue;
+                }
+            }
+            RunPart(*batch);
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<std::shared_ptr<Batch>> queue_;
+};
+
 template <typename Body>
 inline void ParallelRows(int height, Body body) {
     const unsigned workers = PixelWorkers();
@@ -30,61 +124,152 @@ inline void ParallelRows(int height, Body body) {
         return;
     }
 
-    const int chunk = (height + static_cast<int>(workers) - 1) / static_cast<int>(workers);
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
+    PixelPool::Get().Run(height, static_cast<int>(workers),
+        [](void* context, int rowBegin, int rowEnd) { (*static_cast<Body*>(context))(rowBegin, rowEnd); },
+        &body);
+}
 
-    for (unsigned i = 1; i < workers; ++i) {
-        const int begin = static_cast<int>(i) * chunk;
-        if (begin >= height) break;
-        const int end = begin + chunk < height ? begin + chunk : height;
-        threads.emplace_back([&body, begin, end] { body(begin, end); });
+struct BilinearTap {
+    int first = 0;
+    int second = 0;
+    int weight = 0;
+};
+
+inline void BuildBilinearTaps(int sourceSize, int outSize, std::vector<BilinearTap>& taps) {
+    taps.resize(static_cast<size_t>(outSize));
+    const double ratio = static_cast<double>(sourceSize) / outSize;
+
+    for (int i = 0; i < outSize; ++i) {
+        const double s = (i + 0.5) * ratio - 0.5;
+        const int first = s > 0.0 ? static_cast<int>(s) : 0;
+        const double fraction = s - first > 0.0 ? s - first : 0.0;
+
+        BilinearTap& tap = taps[static_cast<size_t>(i)];
+        tap.first = first;
+        tap.second = first + 1 < sourceSize ? first + 1 : sourceSize - 1;
+        tap.weight = static_cast<int>(fraction * 256.0 + 0.5);
     }
+}
 
-    body(0, chunk < height ? chunk : height);
-
-    for (std::thread& thread : threads) thread.join();
+inline void BuildAreaSpans(int sourceSize, int outSize, std::vector<int>& starts) {
+    starts.resize(static_cast<size_t>(outSize) + 1);
+    for (int i = 0; i <= outSize; ++i) {
+        starts[static_cast<size_t>(i)] = static_cast<int>(static_cast<int64_t>(i) * sourceSize / outSize);
+    }
 }
 
 inline void ScaleToInto(const Image& source, Image& out, int width, int height) {
     if (!source.valid() || width <= 0 || height <= 0) return;
 
-    if (out.width != width || out.height != height) out.allocate(width, height);
+    if (out.width != width || out.height != height) out.reshape(width, height);
 
-    const double xRatio = static_cast<double>(source.width) / width;
-    const double yRatio = static_cast<double>(source.height) / height;
+    const uint8_t* src = source.pixels.data();
+    const size_t srcStride = source.stride();
+
+    if (source.width >= width * 2 && source.height >= height * 2) {
+        std::vector<int> columns;
+        std::vector<int> rows;
+        BuildAreaSpans(source.width, width, columns);
+        BuildAreaSpans(source.height, height, rows);
+
+        ParallelRows(height, [&](int rowBegin, int rowEnd) {
+            for (int y = rowBegin; y < rowEnd; ++y) {
+                const int y0 = rows[static_cast<size_t>(y)];
+                const int y1 = rows[static_cast<size_t>(y) + 1];
+                uint8_t* dst = out.pixels.data() + static_cast<size_t>(y) * out.stride();
+
+                for (int x = 0; x < width; ++x, dst += 4) {
+                    const int x0 = columns[static_cast<size_t>(x)];
+                    const int x1 = columns[static_cast<size_t>(x) + 1];
+                    uint32_t b = 0, g = 0, r = 0;
+
+                    for (int sy = y0; sy < y1; ++sy) {
+                        const uint8_t* p = src + static_cast<size_t>(sy) * srcStride + static_cast<size_t>(x0) * 4;
+                        for (int sx = x0; sx < x1; ++sx, p += 4) {
+                            b += p[0];
+                            g += p[1];
+                            r += p[2];
+                        }
+                    }
+
+                    const uint32_t count = static_cast<uint32_t>((x1 - x0) * (y1 - y0));
+                    const uint32_t half = count / 2;
+                    dst[0] = static_cast<uint8_t>((b + half) / count);
+                    dst[1] = static_cast<uint8_t>((g + half) / count);
+                    dst[2] = static_cast<uint8_t>((r + half) / count);
+                    dst[3] = 255;
+                }
+            }
+        });
+        return;
+    }
+
+    std::vector<BilinearTap> columns;
+    std::vector<BilinearTap> rows;
+    BuildBilinearTaps(source.width, width, columns);
+    BuildBilinearTaps(source.height, height, rows);
 
     ParallelRows(height, [&](int rowBegin, int rowEnd) {
         for (int y = rowBegin; y < rowEnd; ++y) {
-            const double sy = (y + 0.5) * yRatio - 0.5;
-            const int y0 = sy > 0.0 ? static_cast<int>(sy) : 0;
-            const int y1 = y0 + 1 < source.height ? y0 + 1 : source.height - 1;
-            const double fy = sy - y0 > 0.0 ? sy - y0 : 0.0;
+            const BilinearTap& row = rows[static_cast<size_t>(y)];
+            const uint8_t* top = src + static_cast<size_t>(row.first) * srcStride;
+            const uint8_t* bottom = src + static_cast<size_t>(row.second) * srcStride;
+            const int fy = row.weight;
+            const int gy = 256 - fy;
 
-            uint8_t* dstRow = out.pixels.data() + static_cast<size_t>(y) * out.stride();
+            uint8_t* dst = out.pixels.data() + static_cast<size_t>(y) * out.stride();
 
-            for (int x = 0; x < width; ++x) {
-                const double sx = (x + 0.5) * xRatio - 0.5;
-                const int x0 = sx > 0.0 ? static_cast<int>(sx) : 0;
-                const int x1 = x0 + 1 < source.width ? x0 + 1 : source.width - 1;
-                const double fx = sx - x0 > 0.0 ? sx - x0 : 0.0;
+            for (int x = 0; x < width; ++x, dst += 4) {
+                const BilinearTap& column = columns[static_cast<size_t>(x)];
+                const size_t left = static_cast<size_t>(column.first) * 4;
+                const size_t right = static_cast<size_t>(column.second) * 4;
+                const int fx = column.weight;
+                const int gx = 256 - fx;
 
-                const uint8_t* p00 = source.pixels.data() + (static_cast<size_t>(y0) * source.width + x0) * 4;
-                const uint8_t* p01 = source.pixels.data() + (static_cast<size_t>(y0) * source.width + x1) * 4;
-                const uint8_t* p10 = source.pixels.data() + (static_cast<size_t>(y1) * source.width + x0) * 4;
-                const uint8_t* p11 = source.pixels.data() + (static_cast<size_t>(y1) * source.width + x1) * 4;
-
-                uint8_t* dst = dstRow + static_cast<size_t>(x) * 4;
-
-                for (int c = 0; c < 4; ++c) {
-                    const double top = p00[c] + (p01[c] - p00[c]) * fx;
-                    const double bottom = p10[c] + (p11[c] - p10[c]) * fx;
-                    dst[c] = static_cast<uint8_t>(top + (bottom - top) * fy + 0.5);
+                for (int c = 0; c < 3; ++c) {
+                    const int upper = top[left + c] * gx + top[right + c] * fx;
+                    const int lower = bottom[left + c] * gx + bottom[right + c] * fx;
+                    dst[c] = static_cast<uint8_t>((upper * gy + lower * fy + 32768) >> 16);
                 }
+                dst[3] = 255;
             }
         }
     });
 }
+
+class ImagePool : public std::enable_shared_from_this<ImagePool> {
+public:
+    explicit ImagePool(size_t keep) : keep_(keep) {}
+
+    std::shared_ptr<Image> Acquire() {
+        Image* image = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!free_.empty()) {
+                image = free_.back().release();
+                free_.pop_back();
+            }
+        }
+        if (!image) image = new Image();
+
+        const std::weak_ptr<ImagePool> owner = weak_from_this();
+        return std::shared_ptr<Image>(image, [owner](Image* returned) {
+            if (const std::shared_ptr<ImagePool> pool = owner.lock()) pool->Return(returned);
+            else delete returned;
+        });
+    }
+
+private:
+    void Return(Image* image) {
+        std::unique_ptr<Image> owned(image);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (free_.size() < keep_) free_.push_back(std::move(owned));
+    }
+
+    const size_t keep_;
+    std::mutex mutex_;
+    std::vector<std::unique_ptr<Image>> free_;
+};
 
 struct Compositor {
     Image scaled;

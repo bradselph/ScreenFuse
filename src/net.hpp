@@ -60,6 +60,9 @@ enum StreamStatusCode : uint32_t {
 constexpr uint8_t kStreamFlagHeartbeat = 1 << 0;
 
 constexpr uint8_t kStreamStartFlagAudio = 1 << 0;
+constexpr uint8_t kStreamStartFlagFullChroma = 1 << 1;
+
+constexpr uint8_t kStreamStatusFlagFullChroma = 1 << 0;
 
 constexpr uint32_t kMaxAudioPayloadBytes = 1u * 1024u * 1024u;
 
@@ -136,7 +139,8 @@ struct StreamStatusPayload {
     int32_t height;
     int32_t monitorIndex;
     uint8_t method;
-    uint8_t reserved[3];
+    uint8_t flags;
+    uint8_t reserved[2];
     uint32_t sourceFormat;
     wchar_t device[32];
 };

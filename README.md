@@ -151,12 +151,13 @@ recordings are both available without stopping.
 | `--stream-quality <n>` | 80 | JPEG quality the remote PC encodes with |
 | `--stream-scale <n>` | 100 | Percent of the remote PC's resolution to send |
 | `--stream-raw` | off | Uncompressed frames - wired gigabit only |
+| `--high-quality` | off | Full colour detail in the stream, higher recording bitrate - see [High quality](#high-quality) |
 | `--stream-monitor <n>` | window | Show the output fullscreen on a monitor here |
 | `--stream-title <text>` | ScreenFuse Output | Title of the output window |
 | `--audio` | off | Carry the remote PC's sound too - see [Audio](#audio) |
 | `--audio-buffer <ms>` | 80 | Audio jitter buffer (150 with `--stream-raw`) |
 | `--record` | off | Record the merged stream - see [Recording](#recording) |
-| `--record-bitrate <n>` | scaled | H.264 Mbit/s, 2-50 (default ~6 at 1080p30) |
+| `--record-bitrate <n>` | scaled | H.264 Mbit/s, 2-50 (default ~6 at 1080p30, ~15 with `--high-quality`) |
 
 `--overlay-delay`, `--merge`, `--key-low` and `--key-high` mean the same things
 they do for screenshots.
@@ -178,6 +179,42 @@ by the time it is on screen here, before a downstream encoder adds its share.
 
 If something in the chain wants a webcam rather than a window, point OBS at the
 window and turn on OBS's virtual camera; nothing here needs to change for that.
+
+### High quality
+
+```cmd
+screenfuse.exe --host 192.168.1.20 --stream --high-quality
+```
+
+JPEG normally stores colour at half resolution in each direction (4:2:0), which
+is what makes coloured text, HUD elements and thin coloured lines on the remote
+PC's picture look smeared. `--high-quality` (the **High quality** switch in the
+control panel) has the agent keep colour at full resolution (4:4:4), and raises
+the default recording bitrate from about 0.1 to 0.25 bits per pixel per frame
+(about 15 Mbit/s at 1080p30, 31 at 1080p60). An explicit `--record-bitrate`
+still wins.
+
+Full colour costs more network per frame. On a wired link, pair it with a
+higher `--stream-quality` (90 or so) for the cleanest picture; on a tight link,
+keep the quality where it is and lower `--stream-fps` first. It has no effect
+with `--stream-raw`, which is already lossless.
+
+The agent on the remote PC has to come from the same build for this to work.
+An older agent ignores the request and the stream carries on at 4:2:0; the
+console says so when that happens.
+
+### What each side spends
+
+The remote PC only copies a frame off the GPU when it is about to send one, so
+its CPU cost follows `--stream-fps`, not the frame rate of whatever is on its
+screen. The newest frame waits on the GPU until it is due, and cursor-only
+updates are not copied at all. Encoding writes into a reused buffer instead of
+allocating a new one every frame.
+
+Here, frame buffers are recycled instead of allocated per frame, the
+compositor and scaler run on a persistent set of worker threads, and the
+scaler averages every source pixel when shrinking below half size, so a
+`--stream-scale` under 50 no longer shimmers.
 
 `--stream-monitor <n>` puts the output fullscreen on a display instead, for
 capturing a whole monitor. Do not point it at the monitor the overlay is on:
@@ -230,7 +267,13 @@ says so, while streaming works regardless.
   silence, not drift.
 - `--record-bitrate <n>` sets the H.264 rate in Mbit/s (2-50). The default
   scales with resolution and rate - about 0.1 bits per pixel per frame,
-  6 Mbit/s at 1080p30.
+  6 Mbit/s at 1080p30, or 0.25 with `--high-quality`.
+- The GPU's own H.264 encoder is used when the machine has one, which takes
+  the encoding load off the CPU; the console names the encoder each file was
+  started on. Files are High profile with a variable bitrate averaging the
+  rate above. If the hardware encoder cannot be set up, the software encoder
+  is used instead; if it fails mid-recording, that file is closed and a new
+  one continues on the software encoder.
 - If the picture changes size mid-recording (a remote display mode change),
   the current file is closed cleanly and a new one starts.
 - Recording rides through agent reconnects: the gap is one held frame in the
@@ -434,6 +477,8 @@ matters more than bandwidth.
 | Audio is silent but the stream works | The remote PC is muted, its default output has no signal, or it has no sound device (its console says which). |
 | `recording is unavailable: Media Foundation ...` | Windows N edition without the Media Feature Pack. Install it; streaming works without it. |
 | `cannot set up the H.264/AAC encoder` | Same Media Feature Pack case, or the frame exceeds the software encoder's 4096x2304 ceiling - lower `--stream-scale`. |
+| `the agent on the remote PC is from an older build and ignores High quality` | Copy this build's `screenfuse_agent.exe` to the remote PC. |
+| Coloured text or thin coloured lines look smeared in the stream | JPEG colour subsampling. Turn on `--high-quality`. |
 
 ## Files
 

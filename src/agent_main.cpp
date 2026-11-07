@@ -183,7 +183,7 @@ enum class StreamOutcome {
 
 bool SendStreamStatus(SOCKET client, uint32_t status, const MonitorTarget* target,
     int width, int height, bool gdi, uint32_t sourceFormat, const std::string& text,
-    std::mutex* sendMutex = nullptr) {
+    uint8_t flags = 0, std::mutex* sendMutex = nullptr) {
 
     StreamStatusPayload payload{};
     payload.status = status;
@@ -191,6 +191,7 @@ bool SendStreamStatus(SOCKET client, uint32_t status, const MonitorTarget* targe
     payload.height = height;
     payload.monitorIndex = target ? target->index : -1;
     payload.method = static_cast<uint8_t>(gdi ? CaptureMethod::Gdi : CaptureMethod::DesktopDuplication);
+    payload.flags = flags;
     payload.sourceFormat = sourceFormat;
     if (target) wcsncpy_s(payload.device, target->device.c_str(), _TRUNCATE);
 
@@ -370,6 +371,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
     const int scalePercent = Clamp(start.scalePercent ? start.scalePercent : 100, 10, 100);
     const WireFormat format = static_cast<WireFormat>(start.wireFormat);
     const bool wantAudio = (start.flags & kStreamStartFlagAudio) != 0;
+    const bool fullChroma = format == WireFormat::Jpeg && (start.flags & kStreamStartFlagFullChroma) != 0;
 
     const int outWidth = target->width() * scalePercent / 100;
     const int outHeight = target->height() * scalePercent / 100;
@@ -383,7 +385,8 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
     }
 
     if (!SendStreamStatus(client, kStreamStarted, target, outWidth, outHeight,
-        capture.usedGdi(), capture.sourceFormat(), openError)) {
+        capture.usedGdi(), capture.sourceFormat(), openError,
+        fullChroma ? kStreamStatusFlagFullChroma : 0)) {
         return StreamOutcome::LinkLost;
     }
 
@@ -392,7 +395,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
     if (wantAudio) audio.Start(client, sendMutex);
 
     const std::string formatText = format == WireFormat::Jpeg
-        ? "JPEG quality " + std::to_string(quality)
+        ? "JPEG quality " + std::to_string(quality) + (fullChroma ? ", full colour (4:4:4)" : "")
         : std::string("raw BGRA");
 
     LogInfo("stream: monitor %d (%s) %dx%d -> %dx%d, %d fps cap, %s%s",
@@ -403,6 +406,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
     Image frame;
     Image scaled;
     std::vector<uint8_t> encoded;
+    JpegEncoder jpeg;
 
     const int64_t frameTicks = UsToTicks(1000000 / fps);
     int64_t dueTicks = QpcTicks();
@@ -415,6 +419,24 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
     int reopenAttempts = 0;
 
     RateMeter meter;
+
+    const auto recoverCapture = [&](const std::string& what) -> bool {
+        LogWarn("stream: %s", what.c_str());
+        pending = false;
+
+        std::string reopenError;
+        if (++reopenAttempts > 3 || !capture.Open(*target, reopenError)) {
+            const std::string reason = reopenError.empty() ? what : reopenError;
+            LogErr("stream: giving up on this monitor: %s", reason.c_str());
+            audio.StopAndJoin(false);
+            SendStreamStatus(client, kStreamFailed, target, outWidth, outHeight,
+                capture.usedGdi(), capture.sourceFormat(), reason);
+            return false;
+        }
+
+        Sleep(50);
+        return true;
+    };
 
     for (;;) {
         while (WaitReadable(client, 0)) {
@@ -480,18 +502,8 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
         int64_t captureTicks = 0;
         std::string error;
 
-        if (!capture.Next(static_cast<int>(waitUs / 1000), frame, presentTicks, captureTicks, fresh, error)) {
-            LogWarn("stream: %s", error.c_str());
-
-            if (++reopenAttempts > 3 || !capture.Open(*target, error)) {
-                LogErr("stream: giving up on this monitor: %s", error.c_str());
-                audio.StopAndJoin(false);
-                SendStreamStatus(client, kStreamFailed, target, outWidth, outHeight,
-                    capture.usedGdi(), capture.sourceFormat(), error);
-                return StreamOutcome::Stopped;
-            }
-
-            Sleep(50);
+        if (!capture.Next(static_cast<int>(waitUs / 1000), presentTicks, captureTicks, fresh, error)) {
+            if (!recoverCapture(error)) return StreamOutcome::Stopped;
             continue;
         }
 
@@ -500,6 +512,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
             pendingCaptureTicks = captureTicks;
             pendingPresentTicks = presentTicks;
         }
+        if (pending && !capture.hasFrame()) pending = false;
 
         const int64_t now = QpcTicks();
         if (now < dueTicks) continue;
@@ -529,6 +542,11 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
             continue;
         }
 
+        if (!capture.Read(frame, error)) {
+            if (!recoverCapture(error)) return StreamOutcome::Stopped;
+            continue;
+        }
+
         const Image* source = &frame;
         if (scalePercent != 100) {
             ScaleToInto(frame, scaled, frame.width * scalePercent / 100, frame.height * scalePercent / 100);
@@ -540,7 +558,7 @@ StreamOutcome RunStream(SOCKET client, const std::string& peer, const StreamStar
 
         if (format == WireFormat::Jpeg) {
             std::string encodeError;
-            if (!EncodeJpeg(wic.get(), *source, quality, encoded, encodeError)) {
+            if (!jpeg.Encode(wic.get(), *source, quality, fullChroma, encoded, encodeError)) {
                 LogErr("stream: %s", encodeError.c_str());
                 audio.StopAndJoin(false);
                 SendStreamStatus(client, kStreamFailed, target, outWidth, outHeight,

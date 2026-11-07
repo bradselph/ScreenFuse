@@ -181,6 +181,10 @@ inline const char* IndexHtml() {
           <span class="switch-label">Raw (uncompressed) frames</span>
           <span class="switch"><input type="checkbox" id="opt-stream-raw" data-flag="--stream-raw"><span class="switch-slider"></span></span>
         </label>
+        <label class="switch-row">
+          <span class="switch-label">High quality</span>
+          <span class="switch"><input type="checkbox" id="opt-high-quality" data-flag="--high-quality"><span class="switch-slider"></span></span>
+        </label>
       </div>
     </section>
 
@@ -854,6 +858,7 @@ const OPTION_FIELDS = [
     { id: "opt-stream-quality", key: "streamQuality", type: "int" },
     { id: "opt-stream-scale", key: "streamScale", type: "int" },
     { id: "opt-stream-raw", key: "streamRaw", type: "bool" },
+    { id: "opt-high-quality", key: "highQuality", type: "bool" },
     { id: "opt-stream-title", key: "streamTitle", type: "text" },
     { id: "opt-audio", key: "audio", type: "bool" },
     { id: "opt-audio-buffer", key: "audioBufferMs", type: "int" },

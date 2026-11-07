@@ -245,6 +245,7 @@ inline const std::vector<std::pair<const char*, const char*>>& HelpTable() {
         { "--stream-quality", "JPEG quality the remote PC encodes with, 1-100." },
         { "--stream-scale", "Percent of the remote PC's resolution to send. Costs less picture than quality does." },
         { "--stream-raw", "Send uncompressed frames. Wired gigabit only - about 14 fps at 1080p." },
+        { "--high-quality", "Keeps coloured text and thin lines sharp in the stream and records at a higher bitrate, at the cost of more network and larger files." },
         { "--stream-monitor", "Show the merged output fullscreen on a display here instead of in a window. Never point it at the overlay's own monitor." },
         { "--stream-title", "Title of the output window, which is what OBS or Discord will list as a source." },
         { "--audio", "Also capture what the remote PC is playing and play it here. Crosses the network in the clear, like the pixels." },
@@ -604,6 +605,7 @@ inline void Engine::PreviewEncoderBody() {
     Image source;
     Image scaled;
     std::vector<uint8_t> jpeg;
+    JpegEncoder encoder;
 
     for (;;) {
         {
@@ -611,8 +613,7 @@ inline void Engine::PreviewEncoderBody() {
             previewCv_.wait(lock, [&] { return previewStop_ || previewHasWork_; });
             if (previewStop_) return;
 
-            source = std::move(previewPending_);
-            previewPending_ = Image{};
+            std::swap(source, previewPending_);
             previewHasWork_ = false;
         }
 
@@ -627,7 +628,7 @@ inline void Engine::PreviewEncoderBody() {
         }
 
         std::string error;
-        if (EncodeJpeg(wic.get(), *toEncode, kPreviewQuality, jpeg, error)) {
+        if (encoder.Encode(wic.get(), *toEncode, kPreviewQuality, false, jpeg, error)) {
             preview_.Publish(jpeg);
         }
     }

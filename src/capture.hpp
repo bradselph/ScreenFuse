@@ -551,12 +551,13 @@ public:
     }
 
     void Close() {
-        DropStaging();
+        DropTextures();
         session_.Reset();
+        gdiFrame_ = Image{};
         gdi_ = false;
     }
 
-    bool Next(int timeoutMs, Image& out, int64_t& presentTicks, int64_t& captureTicks, bool& fresh, std::string& error) {
+    bool Next(int timeoutMs, int64_t& presentTicks, int64_t& captureTicks, bool& fresh, std::string& error) {
         fresh = false;
         presentTicks = 0;
 
@@ -566,8 +567,9 @@ public:
             CaptureOutput capture;
             if (!CaptureGdi(target_, QpcTicks(), capture, error)) return false;
 
-            out = std::move(capture.image);
+            gdiFrame_ = std::move(capture.image);
             captureTicks = capture.captureTicks;
+            haveFrame_ = true;
             fresh = true;
             return true;
         }
@@ -582,9 +584,10 @@ public:
         if (hr == DXGI_ERROR_ACCESS_LOST) {
             if (resource) resource->Release();
             if (!session_.Duplicate(error)) {
-                DropStaging();
+                DropTextures();
                 return session_.Open(target_, error);
             }
+            haveFrame_ = false;
             return true;
         }
 
@@ -593,59 +596,59 @@ public:
             return false;
         }
 
-        ID3D11Texture2D* texture = nullptr;
-        bool ok = SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&texture))) && texture != nullptr;
-        if (ok) {
-            ok = ReadInto(texture, out, error);
+        bool ok = true;
+
+        if (info.LastPresentTime.QuadPart == 0 && haveFrame_) {
             captureTicks = QpcTicks();
-            presentTicks = info.LastPresentTime.QuadPart;
-            texture->Release();
+            fresh = true;
         } else {
-            error = "duplication handed back something that is not a texture";
+            ID3D11Texture2D* texture = nullptr;
+            ok = SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&texture))) && texture != nullptr;
+            if (ok) {
+                ok = KeepLatest(texture, error);
+                if (ok) {
+                    captureTicks = QpcTicks();
+                    presentTicks = info.LastPresentTime.QuadPart;
+                    haveFrame_ = true;
+                    fresh = true;
+                }
+                texture->Release();
+            } else {
+                error = "duplication handed back something that is not a texture";
+            }
         }
 
         resource->Release();
         session_.duplication()->ReleaseFrame();
-
-        fresh = ok;
         return ok;
     }
 
-    bool usedGdi() const { return gdi_; }
-    uint32_t sourceFormat() const { return sourceFormat_; }
+    bool Read(Image& out, std::string& error) {
+        if (!haveFrame_) {
+            error = "no frame has been captured yet";
+            return false;
+        }
 
-private:
-    void DropStaging() {
-        if (staging_) { staging_->Release(); staging_ = nullptr; }
-        stagingWidth_ = stagingHeight_ = 0;
-        stagingFormat_ = DXGI_FORMAT_UNKNOWN;
-    }
+        if (gdi_) {
+            out = gdiFrame_;
+            return true;
+        }
 
-    bool ReadInto(ID3D11Texture2D* texture, Image& out, std::string& error) {
-        D3D11_TEXTURE2D_DESC desc{};
-        texture->GetDesc(&desc);
-        sourceFormat_ = static_cast<uint32_t>(desc.Format);
-
-        if (!staging_ || desc.Width != stagingWidth_ || desc.Height != stagingHeight_ || desc.Format != stagingFormat_) {
-            if (staging_) { staging_->Release(); staging_ = nullptr; }
-
-            D3D11_TEXTURE2D_DESC stagingDesc = desc;
+        if (!staging_) {
+            D3D11_TEXTURE2D_DESC stagingDesc = latestDesc_;
             stagingDesc.Usage = D3D11_USAGE_STAGING;
             stagingDesc.BindFlags = 0;
             stagingDesc.MiscFlags = 0;
             stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
             if (FAILED(session_.device()->CreateTexture2D(&stagingDesc, nullptr, &staging_))) {
+                staging_ = nullptr;
                 error = "cannot create the staging texture";
                 return false;
             }
-
-            stagingWidth_ = desc.Width;
-            stagingHeight_ = desc.Height;
-            stagingFormat_ = desc.Format;
         }
 
-        session_.context()->CopyResource(staging_, texture);
+        session_.context()->CopyResource(staging_, latest_);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (FAILED(session_.context()->Map(staging_, 0, D3D11_MAP_READ, 0, &mapped))) {
@@ -653,35 +656,78 @@ private:
             return false;
         }
 
-        if (out.width != static_cast<int>(desc.Width) || out.height != static_cast<int>(desc.Height)) {
-            out.allocate(static_cast<int>(desc.Width), static_cast<int>(desc.Height));
-        }
+        const int width = static_cast<int>(latestDesc_.Width);
+        const int height = static_cast<int>(latestDesc_.Height);
+        if (out.width != width || out.height != height || !out.valid()) out.reshape(width, height);
 
         const uint8_t* sourceRow = static_cast<const uint8_t*>(mapped.pData);
         bool ok = true;
 
-        for (int y = 0; y < out.height && ok; ++y) {
-            ok = ConvertRow(sourceRow, out.pixels.data() + static_cast<size_t>(y) * out.stride(), out.width, desc.Format);
+        for (int y = 0; y < height && ok; ++y) {
+            ok = ConvertRow(sourceRow, out.pixels.data() + static_cast<size_t>(y) * out.stride(), width, latestDesc_.Format);
             sourceRow += mapped.RowPitch;
         }
 
         session_.context()->Unmap(staging_, 0);
 
         if (!ok) {
-            error = std::string("unsupported desktop surface format ") + FormatName(desc.Format);
+            error = std::string("unsupported desktop surface format ") + FormatName(latestDesc_.Format);
             return false;
         }
 
-        for (size_t i = 3; i < out.pixels.size(); i += 4) out.pixels[i] = 255;
+        return true;
+    }
+
+    bool hasFrame() const { return haveFrame_; }
+    int frameWidth() const { return gdi_ ? gdiFrame_.width : static_cast<int>(latestDesc_.Width); }
+    int frameHeight() const { return gdi_ ? gdiFrame_.height : static_cast<int>(latestDesc_.Height); }
+
+    bool usedGdi() const { return gdi_; }
+    uint32_t sourceFormat() const { return sourceFormat_; }
+
+private:
+    void DropTextures() {
+        if (staging_) { staging_->Release(); staging_ = nullptr; }
+        if (latest_) { latest_->Release(); latest_ = nullptr; }
+        latestDesc_ = D3D11_TEXTURE2D_DESC{};
+        haveFrame_ = false;
+    }
+
+    bool KeepLatest(ID3D11Texture2D* texture, std::string& error) {
+        D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+
+        if (!latest_ || desc.Width != latestDesc_.Width || desc.Height != latestDesc_.Height ||
+            desc.Format != latestDesc_.Format) {
+            DropTextures();
+
+            D3D11_TEXTURE2D_DESC keepDesc = desc;
+            keepDesc.Usage = D3D11_USAGE_DEFAULT;
+            keepDesc.BindFlags = 0;
+            keepDesc.CPUAccessFlags = 0;
+            keepDesc.MiscFlags = 0;
+
+            if (FAILED(session_.device()->CreateTexture2D(&keepDesc, nullptr, &latest_))) {
+                latest_ = nullptr;
+                error = "cannot create the frame texture";
+                return false;
+            }
+
+            latestDesc_ = desc;
+        }
+
+        session_.context()->CopyResource(latest_, texture);
+        sourceFormat_ = static_cast<uint32_t>(desc.Format);
         return true;
     }
 
     MonitorTarget target_{};
     DuplicationSession session_;
+    ID3D11Texture2D* latest_ = nullptr;
     ID3D11Texture2D* staging_ = nullptr;
-    UINT stagingWidth_ = 0;
-    UINT stagingHeight_ = 0;
-    DXGI_FORMAT stagingFormat_ = DXGI_FORMAT_UNKNOWN;
+    D3D11_TEXTURE2D_DESC latestDesc_{};
+    Image gdiFrame_;
+    bool haveFrame_ = false;
     bool gdi_ = false;
     uint32_t sourceFormat_ = 0;
 };
